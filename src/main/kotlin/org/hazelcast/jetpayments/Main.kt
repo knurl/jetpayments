@@ -1,8 +1,5 @@
-@file:OptIn(ExperimentalCoroutinesApi::class)
-
 package org.hazelcast.jetpayments
 
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import org.hazelcast.jetpayments.AppConfig.paymentAmountRand
 import org.hazelcast.jetpayments.AppConfig.paymentProcessingDelayRand
@@ -17,7 +14,7 @@ import kotlin.time.DurationUnit
 import kotlin.time.TimeSource
 
 /*
- * Main entry point for the jetpayments. This is where the PaymentsRun is started.
+ * Main entry point. This is where the PaymentsRun is started.
  */
 fun main(): Unit = runBlocking {
     val logger = ElapsedTimeLogger("Main")
@@ -99,16 +96,10 @@ internal val seededRandom = Random(AppConfig.seed)
 
 /*
  * We want to measure time from a single baseline at the beginning of the test.
- * Encapsulate that here. Allow it to be reset in the case of multiple payments
- * runs in sequence.
+ * Encapsulate that here.
  */
 internal object Epoch {
     private var theEpoch = TimeSource.Monotonic.markNow()
-
-    fun reset() {
-        theEpoch = TimeSource.Monotonic.markNow()
-    }
-
     fun elapsed() = theEpoch.elapsedNow()
 }
 
