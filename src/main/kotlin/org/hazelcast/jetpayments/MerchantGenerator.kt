@@ -103,12 +103,6 @@ class MerchantGenerator(
             .map { ('0'..'9').random(seededRandom) }.joinToString("")
     }
 
-    data class Merchant(
-        val id: String,
-        val name: String,
-        val shortName: String,
-    )
-
     val merchantMap = merchantPairs.associate { (prefix, suffix) ->
         val name = prefix + suffix
         val shortName = prefix.take(1).uppercase() + suffix.take(1).uppercase()
@@ -131,3 +125,4 @@ class MerchantGenerator(
         }
     }
 }
+

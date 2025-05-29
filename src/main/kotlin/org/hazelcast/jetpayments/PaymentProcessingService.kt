@@ -15,28 +15,9 @@ import kotlin.time.Duration.Companion.seconds
  * processor. There is a delay() function below which represents the API call to the
  * payment processor, and the time taken to wait on and process the response.
  */
-class PaymentProcessingService(private val instance: HazelcastInstance) :
+internal class PaymentProcessingService(private val instance: HazelcastInstance) :
     AutoCloseable {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-
-    /*
-     * Provide a facility for simulating payment processor failures. So, not a
-     * Hazelcast failure here, but simulate what would happen if the API call the
-     * Payment Processor failed somehow. This was mostly for debugging purposes, but
-     * it might be try to turn this on and see the result. Rather than doing random
-     * failures, we've done this using a Kotlin StateFlow that simulates failures
-     * occuring regularly in 'runs'. So for 2 report cycles (10s by default) we'll
-     * get a run of successful payments, then for one report cycle we'll get a run
-     * of failures, then the cycle will repeat.
-     */
-    private val paymentSucceeded = flow {
-        while (AppConfig.simulatePaymentProcessorFailure) {
-            delay(AppConfig.reportFrequency * 2) // work for 2/3 of time
-            emit(false)
-            delay(AppConfig.reportFrequency) // fail 1/3 of time
-            emit(true)
-        }
-    }.stateIn(scope, SharingStarted.Eagerly, true)
 
     /*
      * All of our logging uses a member index (node number) to represent the nodes,
@@ -69,15 +50,32 @@ class PaymentProcessingService(private val instance: HazelcastInstance) :
     }
 
     /*
+     * Provide a facility for simulating payment processor failures, i.e. simulate
+     * what would happen if the API call the Payment Processor failed somehow. This
+     * was mostly for debugging purposes, but it might be interesting to turn this
+     * on and see the result. Rather than doing random failures, we've done this
+     * using a Kotlin StateFlow that simulates failures occuring regularly in
+     * 'runs'. So for 2 report cycles (10s by default) we'll get a run of successful
+     * payments, then for one report cycle we'll get failures, then we repeat.
+     */
+    private val paymentSucceeded = flow {
+        while (AppConfig.simulatePaymentProcessorFailure) {
+            delay(AppConfig.reportFrequency * 2) // work for 2/3 of time
+            emit(false) // switches StateFlow to "fail payments"
+            delay(AppConfig.reportFrequency) // fail 1/3 of time
+            emit(true) // switches StateFlow back to "succeed payments"
+        }
+    }.stateIn(scope, SharingStarted.Eagerly, true)
+
+    /*
      * This is the function that is actually called by the payment processing Jet
-     * pipeline to process payments. It converts a payment request into a payment
-     * receipt. The downstream verification that all payments were paid checks both
-     * for the presence of a payment receipt, and that the receipt shows the payment
-     * as paid. We create a CompletableFuture here, rather than a Deferred, for
+     * pipeline to process payments. It must be thread-safe. It simulates a call to
+     * a real payment processor by doing (1) a random delay, and the creation of a
+     * "payment receipt" that indicates whether the payment succeeded or not. The
+     * downstream verification that all payments were paid checks both for the
+     * presence of a payment receipt, and that the receipt shows the payment as
+     * paid. We create a CompletableFuture here, rather than a Deferred, for
      * compatibility with Java code.
-     *
-     * In the case that we're configured to simulate payment processor failures,
-     * we'll do that by producing some receipts marked as non-paid.
      */
     fun processPaymentAsync(paymentRequest: PaymentRequest) = scope.future {
         // Simulate the delay inherent in request-respond to payment processor

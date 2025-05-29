@@ -39,19 +39,20 @@ internal class TimeRange(
 /*
  * Generalized function for combining a list of items into a condensed list.
  */
-internal fun <T> combine(
-    items: List<T>,
+internal fun <T> List<T>.combine(
     combinable: (T, T) -> Boolean,
-    combine: (T, T) -> T,
+    combineFun: (T, T) -> T,
 ): List<T> {
-    if (items.isEmpty()) return emptyList()
-    return items.fold(mutableListOf(items.first())) { acc, curr ->
-        if (combinable(acc.last(), curr)) {
-            acc[acc.lastIndex] = combine(acc.last(), curr)
-        } else {
-            acc.add(curr)
+    if (this.isEmpty()) return emptyList()
+    return this.fold(mutableListOf(this.first())) { acc, curr ->
+        acc.apply {
+            val last = last()
+            val toAdd = if (combinable(last, curr)) {
+                removeLast()
+                combineFun(last, curr)
+            } else curr
+            add(toAdd)
         }
-        acc
     }
 }
 
@@ -60,4 +61,4 @@ internal fun <T> combine(
  */
 internal fun foldTimeRanges(
     sortedTimeRanges: List<TimeRange>,
-) = combine(sortedTimeRanges, TimeRange::isMergeable, TimeRange::merge)
+) = sortedTimeRanges.combine(TimeRange::isMergeable, TimeRange::merge)

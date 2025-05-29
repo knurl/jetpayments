@@ -8,7 +8,7 @@ import kotlin.time.Duration
  */
 internal open class Canvas(
     timespans: List<TimeSpan>, // provided in-order from top to bottom
-    val canvasSize: Int = (AppConfig.screenWidthWithoutPrefix),
+    val canvasSize: Int = AppConfig.screenWidth - AppConfig.logPrefixLen - timespans.maxOf { it.prefix.numCodepoints() } - 8,
 ) {
     init {
         require(timespans.isNotEmpty()) { "Must be at least one input" }
@@ -27,12 +27,9 @@ internal open class Canvas(
     fun draw(): List<String> {
         require(spans.isNotEmpty()) { "Must be at least one input" }
 
-        return spans.map { span ->
-            val paddedPrefix = span.prefix.padStart(maxPrefixLen)
-            val minTime = canvasMinTime.inWholeSeconds
-            val maxTime = canvasMaxTime.inWholeSeconds
-            "$paddedPrefix => ${minTime}s|${span.draw()}|${maxTime}s"
-        }
+        return TextBox(spans.map { span ->
+            "${span.prefix.padStart(maxPrefixLen)} => │${span.draw()}│"
+        }, borderStyle = TextBox.BorderStyle.THICK).toStrings()
     }
 
     protected open inner class CanvasSpan(timespan: TimeSpan) {
@@ -125,12 +122,13 @@ internal open class Canvas(
          * starting with 8 and reducing by 2 at a time, until we find a
          * division wherein we can fit all the tick markers into the timescale.
          */
-        val minSpaceBetween = 2
+        val minSpaceBetween = 4
         val ticks =
-            generateSequence(8) { it - 1 }.takeWhile { it >= 2 }.map { numDivs ->
+            generateSequence(8) { it - 2 }.takeWhile { it >= 2 }.map { numDivs ->
                 val divSize = totalCanvasTime / numDivs
-                val tickTimes = List(numDivs - 1) { index ->
-                    canvasMinTime + divSize * (index + 1)
+                val numTicks = numDivs + 1
+                val tickTimes = List(numTicks) { index ->
+                    canvasMinTime + divSize * index
                 }
                 val maxWidth = tickTimes.map { timestamp ->
                     timestamp.toWholeSecStr()
@@ -139,24 +137,30 @@ internal open class Canvas(
                     timestamp.toWholeSecStr()
                 }.map { it.padStart(maxWidth, '0') }
                 val totalWidth =
-                    tickMarks.joinToString(" ".repeat(minSpaceBetween)).length + minSpaceBetween * 2 /* space before & after */
+                    tickMarks.joinToString(" ".repeat(minSpaceBetween)).length /* space before & after */
                 Ticks(numDivs, divSize, tickTimes, tickMarks, totalWidth)
             }.first { ticks ->
                 /* Find the first (numDivs = number of divisions) within the sequence
                  * wherein the the total space taken up by *all* of the tick markers,
                  * plus padding on either side, fits within the canvas size. */
-                ticks.totalWidth <= canvasSize && ticks.tickTimes.last() <= canvasMaxTime - ticks.divSize
+                ticks.totalWidth <= canvasSize && ticks.tickTimes.last() <= canvasMaxTime
             }
 
         // Center the tick marks
         val tickTimeRanges =
             ticks.tickMarks.zip(ticks.tickTimes).map { (marker, timestamp) ->
                 (timePerUnit * marker.numCodepoints()).let { width ->
-                    val start = (timestamp - width / 2).coerceAtLeast(canvasMinTime)
-                    val endInclusive = (start + width).coerceAtMost(canvasMaxTime)
-                    TimeRange(marker, start, endInclusive)
+                    val start = (timestamp - width / 2)
+                    val endInclusive = (start + width)
+                    if (start < canvasMinTime) { // adjust right
+                        TimeRange(marker, canvasMinTime, canvasMinTime + width)
+                    } else if (endInclusive > canvasMaxTime) { // adjust left
+                        TimeRange(marker, canvasMaxTime - width, canvasMaxTime)
+                    } else {
+                        TimeRange(marker, start, endInclusive)
+                    }
                 }
-            }.filter { it.endInclusive <= canvasMaxTime }
+            }
 
         return FixedCanvasSpan(TimeSpan("TIMESCALE", tickTimeRanges))
     }

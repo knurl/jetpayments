@@ -13,14 +13,13 @@ import kotlin.time.Duration.Companion.seconds
  */
 internal class PaymentProcessedCheckPipeline(
     client: HzCluster.ClientInstance,
-    jobName: String,
     private val source: StreamSource<Map.Entry<Int, String>>,
     private val numPayments: Int,
 ) : StreamingJetPipeline(
-    client, jobName, 0.seconds
+    client, AppConfig.paymentProcessedCheckJetJobName.uniqify(), 0.seconds
 ) {
     private val paymentProcessedCheckList =
-        client.getList<TimeRange>(AppConfig.paymentProcessedCheckList)
+        client.getList<TimeRange>(AppConfig.paymentProcessedCheckListName)
 
     override fun describePipeline(): String {
         return """

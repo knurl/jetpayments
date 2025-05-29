@@ -1,12 +1,10 @@
 package org.hazelcast.jetpayments
 
 import com.hazelcast.core.EntryEvent
-import com.hazelcast.map.IMap
 import com.hazelcast.map.listener.EntryAddedListener
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
-import org.hazelcast.jetpayments.MerchantGenerator.Merchant
 
 /*
  * This class observes the creation of PaymentReceipts, and summarizes these and
@@ -32,12 +30,15 @@ import org.hazelcast.jetpayments.MerchantGenerator.Merchant
  * makes it easy to generate the summary.
  */
 class ReceiptWatcher(
-    private val paymentReceiptMap: IMap<Int, PaymentReceipt>,
+    client: HzCluster.ClientInstance,
+    private val numPayments: Int,
     private val merchantMap: Map<String, Merchant>,
-    private val screenWidth: Int,
     private val getNumPaymentsReceived: () -> Int,
 ) : AutoCloseable {
     private val logger = ElapsedTimeLogger("Watcher")
+    private val paymentReceiptMap =
+        client.getMap<Int, PaymentReceipt>(AppConfig.paymentReceiptMapName)
+    private val screenWidth: Int = AppConfig.screenWidth
 
     // Data class that tracks the number of receipts processed on a particular node.
     data class NodeTally(var numProcessed: Int, val onMember: Int)
@@ -50,10 +51,51 @@ class ReceiptWatcher(
      */
     data class Summary(val numReceipts: Int, val receiptSummary: String)
     sealed class ActorMessage {
-        class SetNumPayments(val numPayments: Int) : ActorMessage()
         class Update(val receipt: PaymentReceipt) : ActorMessage()
         class Summarize() : ActorMessage()
-        class Rebuild(val numPayments: Int) : ActorMessage()
+        class Rebuild() : ActorMessage()
+    }
+
+    /*
+     * This is a specialized class used to render the per-merchant fields by the
+     * ReceiptWatcher. For each merchant, we want to show the number of _consecutive_
+     * payments processed for that merchant on a specific node. The TallyField class
+     * takes care of rendering this information in a compact way, so that the user can
+     * see the number of payments processed by for a merchant on each node in time
+     * order.
+     *
+     * The class is initialized with the per-merchant value from the payment receipt
+     * summary map tracked by the ReceiptWatcher.
+     */
+    class TallyField(
+        private val width: Int,
+        private val merchant: String,
+        private val tally: List<NodeTally>
+    ) {
+        init {
+            require(width >= merchant.numCodepoints() + 2)
+        }
+
+        /*
+         * This is the public point of access for the class. It generates the string
+         * representation for the per-merchant field.
+         */
+        fun generate(): String {
+            val merchant = "${merchant}▹"
+            val widthLeft = width - merchant.numCodepoints()
+            val allButLast = tally.dropLast(1).map {
+                "${fontEtched(it.onMember)}×${it.numProcessed}"
+            }
+            val last = tally.lastOrNull()?.let {
+                "${fontEtched(it.onMember)}×${underline(it.numProcessed.toString())}"
+            } ?: "NONE YET"
+            val ticker = (allButLast + last).joinToString(" → ")
+            return if (ticker.numCodepoints() > widthLeft) { // too big for field
+                "$merchant⋯${ticker.trimStart(widthLeft - 1)}"
+            } else {
+                "$merchant${ticker.padStart(widthLeft)}"
+            }
+        }
     }
 
     /*
@@ -75,9 +117,6 @@ class ReceiptWatcher(
             scope.cancel()
         }
 
-        // How many payments will we process in this run?
-        private var numExpectedPayments = 0
-
         /*
          * This is where receipts are summarized, in a way that makes it easy to
          * report. We basically group by merchant, and for each merchant, we have a
@@ -94,8 +133,7 @@ class ReceiptWatcher(
         private val nodeLastUsedForMerchant = sortedMapOf<String, Int>()
 
         // This method clears all of the state listed above.
-        fun clear(numPayments: Int) {
-            this.numExpectedPayments = numPayments
+        fun reset() {
             receiptSummaryMap.clear()
             numReceipts = 0
             nodeLastUsedForMerchant.clear()
@@ -157,12 +195,12 @@ class ReceiptWatcher(
          * payments.
          */
         private fun getMetricsSummary(numReceived: Int) = mapOf(
-            "QUD" to numExpectedPayments - numReceived,
+            "QUD" to numPayments - numReceived,
             "WKG" to numReceived - numReceipts,
             "FIN" to numReceipts,
         ).entries.joinToString(" ⇒ ") { (metricName, metricValue) ->
-            val paddedMetric = metricValue.toString()
-                .padStart(numExpectedPayments.toString().length, '0')
+            val paddedMetric =
+                metricValue.toString().padStart(numPayments.toString().length, '0')
             "$paddedMetric $metricName"
         }.let { "[$it]➣" }
 
@@ -179,11 +217,6 @@ class ReceiptWatcher(
             var ignoreUpdates = false
             inFlow.collect { message ->
                 when (message) {
-                    is ActorMessage.SetNumPayments -> {
-                        ignoreUpdates = false
-                        clear(message.numPayments)
-                    }
-
                     is ActorMessage.Update -> {
                         if (!ignoreUpdates) mergeNewReceipt(message.receipt)
                     }
@@ -194,7 +227,7 @@ class ReceiptWatcher(
 
                     is ActorMessage.Rebuild -> {
                         ignoreUpdates = true
-                        this@ReceiptsActor.clear(message.numPayments)
+                        reset()
                         paymentReceiptMap.values.sorted().forEach { receipt ->
                             mergeNewReceipt(receipt)
                         }
@@ -210,8 +243,6 @@ class ReceiptWatcher(
     } // end of class ReceiptsActor()
 
     private val receiptsActor = ReceiptsActor() // Create the singleton.
-
-    fun clear(numPayments: Int) = receiptsActor.clear(numPayments)
 
     /*
      * Hazelcast EntryAddedListener (which derives MapListener) class. Hazelcast
@@ -240,18 +271,16 @@ class ReceiptWatcher(
         receiptsActor.close()
     }
 
-    private suspend fun requestReceiptsSummary(numPayments: Int) =
-        with(receiptsActor.inFlow) {
-            emit(ActorMessage.SetNumPayments(numPayments))
-            while (true) {
-                delay(AppConfig.reportFrequency)
-                emit(ActorMessage.Summarize())
-            }
+    private suspend fun receiptsSummaryPoll() = with(receiptsActor.inFlow) {
+        while (true) {
+            delay(AppConfig.reportFrequency)
+            emit(ActorMessage.Summarize())
         }
+    }
 
-    suspend fun logReceiptSummary(numPayments: Int) = coroutineScope {
+    suspend fun startReceiptsLog() = coroutineScope {
         var previousNumReceipts = 0
-        launch { requestReceiptsSummary(numPayments) }
+        launch { receiptsSummaryPoll() }
 
         receiptsActor.outFlow.onEach { (_, receiptSummary) ->
             receiptSummary.let { if (it.isNotEmpty()) logger.log(it) }
@@ -259,14 +288,14 @@ class ReceiptWatcher(
             this@coroutineScope.cancel()
         }.collect { (numReceipts, _) ->
             /* NOTE: Hazelcast MapListener Events are not treated as highly
-             * available from a Hazelcast perspective, and as we are
-             * bringing nodes down, we might miss a few messages. If it
-             * seems that our receipt count isn't advancing at the end of
-             * the process, rebuild our data from the source map.
+             * available from a Hazelcast perspective, and as we are bringing nodes
+             * down, we might miss a few messages. If it seems that our receipt
+             * count isn't advancing at the end of the process, rebuild our data
+             * from the source map.
              */
             if (numReceipts == previousNumReceipts && getNumPaymentsReceived() == numPayments) {
                 with(receiptsActor.inFlow) {
-                    emit(ActorMessage.Rebuild(numPayments))
+                    emit(ActorMessage.Rebuild())
                     emit(ActorMessage.Summarize())
                 }
             }

@@ -12,10 +12,11 @@ import com.hazelcast.jet.pipeline.Sources
  * distribution of merchants to nodes will change, but we want to show that at no
  * time are payments for a given merchant performed on multiple nodes at once.
  */
-class PaymentMemberCheckPipeline(
-    client: HzCluster.ClientInstance, jobName: String, receiptsMapName: String,
-) : JetPipeline(client, jobName) {
-    private val source = Sources.map<Int, PaymentReceipt>(receiptsMapName)
+class PaymentMemberCheckPipeline(client: HzCluster.ClientInstance) :
+    JetPipeline(client, AppConfig.paymentOnOneNodeCheckJetJobName.uniqify()) {
+
+    private val source =
+        Sources.map<Int, PaymentReceipt>(AppConfig.paymentReceiptMapName)
 
     override fun describePipeline(): String {
         return """
@@ -35,13 +36,16 @@ class PaymentMemberCheckPipeline(
             .groupingKey { receipt: PaymentReceipt -> receipt.merchantId }
             .aggregate(AggregateOperations.toList())
             .map { (merchantId, receipts: Iterable<PaymentReceipt>) ->
-                // Create a list of (paidOnMember, timePaid) tuples
+                /*
+                 * For each merchant, create a sorted list of TimeRanges keyed by
+                 * the node the payment was processed on.
+                 */
                 merchantId to receipts.sorted().map { receipt ->
-                    TimeRange(fontEtched(receipt.onMember), receipt.timePaid)
+                    TimeRange(receipt.onMember.toString(), receipt.timePaid)
                 }
             }.writeTo(
                 Sinks.map(
-                    AppConfig.paymentOnOneNodeCheckMap,
+                    AppConfig.paymentOnOneNodeCheckMapName,
                     { it.first },
                     { it.second })
             )

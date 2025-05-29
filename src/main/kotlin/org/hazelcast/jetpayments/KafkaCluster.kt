@@ -1,5 +1,6 @@
 package org.hazelcast.jetpayments
 
+import com.google.common.math.IntMath.pow
 import com.hazelcast.jet.kafka.KafkaSources
 import com.hazelcast.jet.pipeline.StreamSource
 import kotlinx.coroutines.*
@@ -67,6 +68,7 @@ class KafkaCluster<K, V>(
     private fun Map<String, Any>.toProperties() = Properties().apply {
         putAll(this@toProperties)
     }
+
     private val topicCreateJob: Job
     private val createTopicScope =
         CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -156,14 +158,10 @@ class KafkaCluster<K, V>(
 
     // Make sure the topic gets created before we start publishing to it.
     private suspend fun ensureTopic() {
-        var numAttempt = 0
-        var backoff = 1.seconds
-
-        while (++numAttempt <= 300) {
+        repeat(5) { attempt ->
             AdminClient.create(kafkaProps.toProperties()).use { admin ->
                 if (createTopic(admin)) return
-                delay(backoff)
-                backoff *= 2
+                delay(pow(2, attempt).seconds)
                 deleteTopic(admin)
             }
         }

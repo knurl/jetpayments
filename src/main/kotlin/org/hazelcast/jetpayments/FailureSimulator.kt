@@ -1,11 +1,10 @@
 package org.hazelcast.jetpayments
 
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlin.time.Duration
-import kotlin.time.DurationUnit
-import kotlin.time.toDuration
 
 /*
  * Simulate the failure and recovery of nodes in the Hazelcast cluster so we can
@@ -16,7 +15,7 @@ import kotlin.time.toDuration
  */
 internal class FailureSimulator(
     private val client: HzCluster.ClientInstance,
-    private val watcher: ReceiptWatcher,
+    private val getNodesInUse: () -> List<Int>
 ) {
     private val logger = ElapsedTimeLogger("FailSim")
 
@@ -28,47 +27,23 @@ internal class FailureSimulator(
     private val eventTimeRanges =
         Array(client.originalClusterSize) { mutableListOf<TimeRange>() }
 
-    fun clear() {
-        eventTimeRanges.forEach {
-            it.clear()
-        }
-    }
-
     /*
-     * Keep track, across all payment runs, of the average time of failure, and of
-     * recovery, measuring both from the point of initiation of the topology change,
-     * right up to the point where Jet recognizes this change and reschedules
-     * accordingly.
+     * Suspending call to run all the failure simulations for this payment run. The
+     * flow we're collecting here will stop emitting when we don't have enough time
+     * to run any more complete failure simulation cycles (bringing a node down,
+     * *and* back up again). Whether we have enough time, is determined from the
+     * pipelineHasTimeLeft() function passed in here. When all down/up cycles have
+     * finished, this method will return a list of TimeSpans, showing when nodes
+     * were brown down or up, measuring from the point from initiating the topology
+     * change to the point where Jet has rescheduled work across members according
+     * to the new topology.
      */
-    private val failureStats = object {
-        var times =
-            NodeCycleRequest.entries.associateWith { mutableListOf<Double>() }
-
-        fun addTime(nodeCycleRequest: NodeCycleRequest, elapsed: Duration) {
-            times[nodeCycleRequest]?.add(elapsed.toDouble(DurationUnit.SECONDS))
-        }
-
-        fun getSummary() = times.map { (nodeCycleRequest, dataPoints) ->
-            "Average time for $nodeCycleRequest: ${
-                dataPoints.average().toDuration(DurationUnit.SECONDS)
-                    .toRoundedSeconds()
-            }"
-        }
-    }
-
-    fun getFailureStats() = failureStats.getSummary()
-
-    /*
-     * Suspending call to run all the failure simulations for this payment run.
-     * The flow we're collecting here will stop emitting when we don't have enough
-     * time to run any more complete failure simulation cycles (bringing a node
-     * down, *and* back up again). At that point, the function will return. Note
-     * that we will measure from the point of initiating the node down or up, to
-     * the point that Jet has rescheduled work across the members according to the
-     * new topology.
-     */
-    suspend fun runSimulations(pipeline: StreamingJetPipeline) =
-        failureFlow(pipeline).collect { (nodeCycleRequest, member) ->
+    suspend fun runSimulations(
+        jetSchedulerStateFlow: StateFlow<JetPipeline.JetSchedulerState>,
+        pipelineHasTimeLeft: (Duration) -> Boolean, // Do we have this much time?
+    ): List<TimeSpan> {
+        failureFlow(pipelineHasTimeLeft).collect { (nodeCycleRequest, member) ->
+            fun emph(str: String) = "/=> ${italic(str)} <=/"
             val marker = when (nodeCycleRequest) {
                 NodeCycleRequest.SHUTDOWN_NODE -> "↓"
                 NodeCycleRequest.RESTORE_NODE -> "↑"
@@ -76,27 +51,24 @@ internal class FailureSimulator(
 
             val reqName = nodeCycleRequest.name
             val memberName = fontEtched(member)
+            logger.log(emph("Starting $reqName $memberName"))
 
-            logger.logEmphasis("Initiating $reqName $memberName...")
-
-            // Adjust cluster topology and note the elapsed time for it.
-            val start = Epoch.elapsed()
-            adjustClusterState(nodeCycleRequest, member, pipeline)
-            val end = Epoch.elapsed()
-
+            // Adjust cluster topology and note the timeNow time for it.
+            val start = Epoch.timeNow()
+            adjustClusterState(nodeCycleRequest, member, jetSchedulerStateFlow)
+            val end = Epoch.timeNow()
             eventTimeRanges[member].add(TimeRange(marker, start, end))
 
-            val elapsed = end - start
-            failureStats.addTime(nodeCycleRequest, elapsed)
-
-            logger.logEmphasis("Completed $reqName $memberName in ${elapsed.toRoundedSeconds()}")
+            logger.log(emph("Finished $reqName $memberName"))
         }
+        return getTimeSpans()
+    }
 
     /*
      * We call this after all the failure simulations are complete, in order to get
      * the measured time of the failure cycles so we can graph these.
      */
-    fun getTimeSpans() =
+    private fun getTimeSpans() =
         eventTimeRanges.mapIndexed { member, timeRanges -> member to timeRanges }
             .filter { it.second.isNotEmpty() }.map { (member, timeRanges) ->
                 TimeSpan("NODE ${fontEtched(member)}", timeRanges)
@@ -112,19 +84,19 @@ internal class FailureSimulator(
     private suspend fun adjustClusterState(
         nodeCycleRequest: NodeCycleRequest,
         member: Int,
-        pipeline: JetPipeline,
+        jetSchedulerStateFlow: StateFlow<JetPipeline.JetSchedulerState>
     ) {
         when (nodeCycleRequest) {
             NodeCycleRequest.SHUTDOWN_NODE -> {
-                pipeline.jetSchedulerStateFlow.first { it is JetPipeline.JetSchedulerState.Running }
+                jetSchedulerStateFlow.first { it is JetPipeline.JetSchedulerState.Running }
                 client.shutdownMember(member)
-                pipeline.jetSchedulerStateFlow.first { it is JetPipeline.JetSchedulerState.RunningWithNodeDown }
+                jetSchedulerStateFlow.first { it is JetPipeline.JetSchedulerState.RunningWithNodeDown }
             }
 
             NodeCycleRequest.RESTORE_NODE -> {
-                pipeline.jetSchedulerStateFlow.first { it is JetPipeline.JetSchedulerState.RunningWithNodeDown }
+                jetSchedulerStateFlow.first { it is JetPipeline.JetSchedulerState.RunningWithNodeDown }
                 client.restartMember(member)
-                pipeline.jetSchedulerStateFlow.first { it is JetPipeline.JetSchedulerState.Running }
+                jetSchedulerStateFlow.first { it is JetPipeline.JetSchedulerState.Running }
             }
         }
     }
@@ -137,18 +109,28 @@ internal class FailureSimulator(
      * down or back up again. Thus it is this function, failureFlow, that provides
      * the overall timing and rhythm for the failure simulator.
      */
-    private fun failureFlow(pipeline: StreamingJetPipeline) = flow {
+    private fun failureFlow(pipelineHasTimeLeft: (Duration) -> Boolean) = flow {
         delay(AppConfig.warmupTime)
+        val alreadySelected = mutableSetOf<Int>()
 
         /* Always do the DOWN and UP as a pair. If we don't have enough time
          * left to do the full cycle, then don't start one.
          */
-        while (pipeline.hasTimeLeft(AppConfig.failureCycleTime)) {
+        while (pipelineHasTimeLeft(AppConfig.failureCycleTime)) {
             delay(AppConfig.steadyStateTime) // steadyStateTime
-            val memberToKill = watcher.nodesInUse.value.let {
-                if (it.isNotEmpty()) it.random(seededRandom)
-                else (0 until client.originalClusterSize).random(seededRandom)
+            val memberToKill = getNodesInUse().toSet().let { available ->
+                if (available.isEmpty()) {
+                    (0 until client.originalClusterSize).random(seededRandom)
+                } else {
+                    val unselected = available - alreadySelected
+                    if (unselected.isNotEmpty()) {
+                        unselected.random(seededRandom)
+                    } else {
+                        available.random(seededRandom)
+                    }
+                }
             }
+            alreadySelected.add(memberToKill)
             emit(NodeCycleRequest.SHUTDOWN_NODE to memberToKill) // 4 * snapshot
             delay(AppConfig.steadyStateTime) // steadyStateTime
             emit(NodeCycleRequest.RESTORE_NODE to memberToKill) // 4 * snapshot

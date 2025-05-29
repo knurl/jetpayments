@@ -18,8 +18,7 @@ data class PaymentRequest(
     val timeIssued: Duration, // when the payment was published to Kafka
     val merchantId: String,
     val merchantName: String,
-) : java.io.Serializable {
-    fun toJsonString(): String = Json.Default.encodeToString(this)
-}
+) : java.io.Serializable
 
 fun String.toPaymentRequest() = Json.Default.decodeFromString<PaymentRequest>(this)
+fun PaymentRequest.toJsonString(): String = Json.Default.encodeToString(this)

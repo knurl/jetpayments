@@ -155,11 +155,14 @@ abstract class JetPipeline(
      */
     suspend fun run() {
         // Provide some helpful info on the Jet pipeline to the user
-        logger.log("Starting Jet job $jobName.")
-        describePipeline().wrapText(AppConfig.screenWidthWithoutPrefix).lines()
-            .logBoxed(logger, boxStyle = Logger.BoxStyle.SINGLE)
-        pipeline.toDotString().stripTabs().lines()
-            .logBoxed(logger, boxStyle = Logger.BoxStyle.SINGLE)
+        TextBox(bold(italic("Starting Jet job $jobName"))).stack(
+            TextBox(pipeline.toDotString().lines()).addBorder()
+        ).let { left ->
+            val wrapLen =
+                AppConfig.screenWidth - AppConfig.logPrefixLen - left.width - 8
+            val right = TextBox(describePipeline().lines()).rewrap(wrapLen)
+            left.adjoin(right).addBorder().log(logger)
+        }
 
         // Configure the Jet job
         val jetJobConfig = JobConfig().apply {
@@ -177,13 +180,9 @@ abstract class JetPipeline(
             }
         }
 
-        /* Return when the Jet job completes. Note that Jet streaming jobs will
-         * never terminate unless explicitly cancelled, so for those, startPipeline
-         * should be launched in a separate coroutine and the JetPipeline terminated
-         * with terminateJetJob(), or closed with close(), which will terminate. The
-         * call to first() here results in a collect(), which will suspend until it
-         * can find an emitted status from the jetJobStateFlow that matches one in
-         * the list provided.
+        /* Return when the Jet job completes. The call to first() here results in a
+         * collect(), which will suspend until it can find an emitted status from
+         * the jetJobStateFlow that matches one in the list provided.
          */
         jetJobStateFlow.first { status ->
             status in setOf(

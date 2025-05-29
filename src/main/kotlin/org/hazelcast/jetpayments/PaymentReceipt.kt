@@ -30,7 +30,7 @@ data class PaymentReceipt(
         paymentRequest.merchantId,
         paymentRequest.merchantName,
         isPaid,
-        Epoch.elapsed(),
+        Epoch.timeNow(),
         memberIndex
     )
 

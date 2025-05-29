@@ -10,7 +10,6 @@ import java.nio.BufferUnderflowException
  * - [size] Keeps track of how many items are currently in the queue
  */
 class RingBuffer<T>(val capacity: Int = 10) : Iterable<T> {
-    val logger = ElapsedTimeLogger("RingBuffer")
     private val arrayList = mutableListOf<T>()
     private var head = 0 // read index; oldest end
     private var tail = 0 // write index of where to write next (_after_ last item)
