@@ -103,10 +103,9 @@ class PaymentsRun() : AutoCloseable {
         (paymentRequestSeq zip delaySeq).take(numPayments)
             .forEach { (paymentReq, issueDelay) ->
                 // Timestamp and publish each payment, and delay afterward
-                paymentReq.copy(timeIssued = Epoch.timeNow())
-                    .let { stampedPayment ->
-                        kafka.publish(stampedPayment.toJsonString())
-                    }
+                paymentReq.copy(timeIssued = Epoch.timeNow()).let { stampedPayment ->
+                    kafka.publish(stampedPayment.toJsonString())
+                }
                 delay(issueDelay) // Simulate delay
                 countNewPayment() // Count new payment sent to Kafka
             }
@@ -182,18 +181,20 @@ class PaymentsRun() : AutoCloseable {
      */
     private suspend fun showPaymentsDistributedByMerchant(): List<TimeSpan> {
 
-        /* Step I: Run a batch Jet job to show, for each merchant, on which members
-         * their payments were paid at any given moment. The resulting map is keyed
-         * off merchantId, and the values are lists of 0-width TimeRanges with the
-         * marker being the node on which the payment was processed.
+        /* Step I: Run a batch Jet job to show, for each merchant, on which
+         * members their payments were paid at any given moment. The resulting
+         * map is keyed off merchantId, and the values are lists of 0-width
+         * TimeRanges with the marker being the node on which the payment was
+         * processed.
          */
         PaymentMemberCheckPipeline(hzClientDeferred.await()).use { it.run() }
 
-        /* Step II: Collect the TimeRanges (payment receipts) for each merchant back
-         * from the jet job and fold the contiguous ones together, separating by the
-         * node selected for processing. For each merchant, we should see that none
-         * of the TimeRanges should overlap, because that would indicate a case
-         * where the same merchant was being serviced from two different nodes. */
+        /* Step II: Collect the TimeRanges (payment receipts) for each merchant
+         * back from the jet job and fold the contiguous ones together,
+         * separating by the node selected for processing. For each merchant, we
+         * should see that none of the TimeRanges should overlap, because that
+         * would indicate a case where the same merchant was being serviced from
+         * two different nodes. */
         val paymentOnOneNodeCheckMap = hzClientDeferred.await()
             .getMap<String, List<TimeRange>>(AppConfig.paymentOnOneNodeCheckMapName)
         val timeRangesByMerchant =
@@ -214,56 +215,52 @@ class PaymentsRun() : AutoCloseable {
             val prefix = merchantMap[merchantName]!!.name
             TimeSpan(prefix, timeRanges.map { range ->
                 TimeRange(
-                    fontEtched(range.marker.toInt()),
-                    range.start,
-                    range.endInclusive
+                    fontEtched(range.marker.toInt()), range.start, range.endInclusive
                 )
             })
         }.sorted() // sort TimeSpans by start time
     }
 
     /*
-     * PaymentsRun entry point. Do the payments run, and verify afterwards. This is
-     * a _suspend_ method, meaning it must be called from a coroutine, and that
-     * coroutine might suspend at some point. Coroutines, if you're not familiar
-     * with them, are a way of writing asynchronous code that's easier to
-     * understand, and that aren't as heavyweight as threads. They require some
-     * degree of cooperation and planning to work, but Kotlin provides language
-     * support for understanding and managing coroutine concurrency.
+     * PaymentsRun entry point. Do the payments run, and verify afterwards. This
+     * is a _suspend_ method, meaning it must be called from a coroutine, and
+     * that coroutine might suspend at some point. Coroutines, if you're not
+     * familiar with them, are a way of writing asynchronous code that's easier
+     * to understand, and that aren't as heavyweight as threads. They require
+     * some degree of cooperation and planning to work, but Kotlin provides
+     * language support for understanding and managing coroutine concurrency.
      */
-    internal suspend fun run(numFailureCycles: Int) =
-        withContext(Dispatchers.Default) {
-            val client = hzClientDeferred.await()
-            val numPayments = calculateNumPayments(numFailureCycles)
-            showPaymentRunParameters(numFailureCycles, numPayments)
+    internal suspend fun run(numFailureCycles: Int) = withContext(Dispatchers.Default) {
+        val client = hzClientDeferred.await()
+        val numPayments = calculateNumPayments(numFailureCycles)
+        showPaymentRunParameters(numFailureCycles, numPayments)
 
-            // Create a counter for the number of payments we've issued.
-            MutableStateFlow(0).let { numIssued ->
-                // First start the payments flow into Kafka, from which Jet will read
-                launch { issuePaymentsToKafka(numPayments) { numIssued.value++ } }
-                // A service that monitors completed receipts, summarizes and logs them.
-                ReceiptWatcher(client, numPayments, merchantMap) { numIssued.value }
-            }.use { watcher -> /* Like try-with-resources */
+        // Create a counter for the number of payments we've issued.
+        MutableStateFlow(0).let { numIssued ->
+            // First start the payments flow into Kafka, from which Jet will read
+            launch { issuePaymentsToKafka(numPayments) { numIssued.value++ } }
+            // A service that monitors completed receipts, summarizes and logs them.
+            ReceiptWatcher(client, numPayments, merchantMap) { numIssued.value }
+        }.let { watcher ->
 
-                // A service that simulates failures of individual nodes in the cluster.
-                val failSim = FailureSimulator(client) { watcher.nodesInUse.value }
+            // A service that simulates failures of individual nodes in the cluster.
+            val failSim = FailureSimulator(client) { watcher.nodesInUse.value }
 
-                // Read from Kafka, distribute to members, process payments
-                PaymentsJetPipeline(
-                    client, kafka.consumerJetSource(kafkaProcessCG), numPayments
-                ).use { pipeline ->
-                    launch { pipeline.run() } // Start Jet streaming pipeline.
+            // Read from Kafka, distribute to members, process payments
+            PaymentsJetPipeline(
+                client, kafka.consumerJetSource(kafkaProcessCG), numPayments
+            ).use { pipeline ->
+                launch { pipeline.run() } // Start Jet streaming pipeline.
 
-                    coroutineScope {
-                        launch { watcher.startReceiptsLog() }
-                        async {
-                            failSim.runSimulations(
-                                pipeline.jetSchedulerStateFlow,
-                                pipeline::hasTimeLeft
-                            )
-                        }
-                    }.await()
-                } // We hit close() on pipeline, which stops the Jet job.
-            }.also { uptimeSpans -> verifyPayments(numPayments, uptimeSpans) }
-        }
+                coroutineScope {
+                    launch { watcher.startReceiptsLog() }
+                    async {
+                        failSim.runSimulations(
+                            pipeline.jetSchedulerStateFlow, pipeline::hasTimeLeft
+                        )
+                    }
+                }.await()
+            } // We hit close() on pipeline, which stops the Jet job.
+        }.also { uptimeSpans -> verifyPayments(numPayments, uptimeSpans) }
+    }
 }

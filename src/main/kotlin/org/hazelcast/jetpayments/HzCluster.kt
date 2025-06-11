@@ -159,12 +159,10 @@ class HzCluster(
     }
 
     suspend fun getClient(): ClientInstance {
-        val memberArray =
-            memberArrayDeferred.await() // Wait until cluster is whole.
+        val memberArray = memberArrayDeferred.await() // Wait until cluster is whole.
         val hzClientInstance = HazelcastClient.newHazelcastClient(config)!!
         // Wait for all Hazelcast members to join the cluster
-        val firstMember =
-            memberArray.firstOrNull() ?: error("No members in cluster!")
+        val firstMember = memberArray.firstOrNull() ?: error("No members in cluster!")
         while (firstMember.cluster.members.size < originalClusterSize) {
             delay(1.seconds)
         }

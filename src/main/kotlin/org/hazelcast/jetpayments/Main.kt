@@ -86,8 +86,7 @@ fun main() {
     }
 }
 
-internal fun paymentRequestDelayNext() =
-    paymentRequestDelayRand.getValue().milliseconds
+internal fun paymentRequestDelayNext() = paymentRequestDelayRand.getValue().milliseconds
 
 internal fun paymentProcessingDelayNext() =
     paymentProcessingDelayRand.getValue().milliseconds
@@ -134,8 +133,7 @@ internal fun Duration.toWholeSecStr() =
  */
 internal abstract class ComparableClosedRange<T : Comparable<T>> : ClosedRange<T>,
     Comparable<ClosedRange<T>> {
-    override fun compareTo(other: ClosedRange<T>) =
-        this.start.compareTo(other.start)
+    override fun compareTo(other: ClosedRange<T>) = this.start.compareTo(other.start)
 }
 
 // Does this ClosedRange overlap with the other?
@@ -147,6 +145,10 @@ internal fun <T : Comparable<T>> doRangesOverlap(ranges: Iterable<ComparableClos
     ranges.sorted().zipWithNext().any { (first, second) ->
         first.overlaps(second)
     }
+
+// Is this Collection already sorted?
+internal fun <T : Comparable<T>> Collection<T>.isSorted() =
+    zipWithNext { a, b -> a <= b }.all { it }
 
 /*
  * Use Java's Random class to create a normal distribution.
@@ -167,8 +169,7 @@ internal class RandomNormalDist(
 // Write this digit using an etched font.
 internal fun fontEtched(digit: Int): String {
     require(digit in 0..9)
-    val etched =
-        listOf("𝟘", "𝟙", "𝟚", "𝟛", "𝟜", "𝟝", "𝟞", "𝟟", "𝟠", "𝟡").toTypedArray()
+    val etched = listOf("𝟘", "𝟙", "𝟚", "𝟛", "𝟜", "𝟝", "𝟞", "𝟟", "𝟠", "𝟡").toTypedArray()
     return etched[digit % etched.size]
 }
 
@@ -216,10 +217,9 @@ internal fun underline(str: String) = "\u001B[4m$str\u001B[0m"
  * a lot for Unicode strings in place of the length property of the String. In order
  * to count correctly, remove any escape sequences present first.
  */
-internal fun String.numCodepoints() =
-    this.replace("\u001B\\[\\d+m".toRegex(), "").let {
-        it.codePointCount(0, it.length)
-    }
+internal fun String.numCodepoints() = this.replace("\u001B\\[\\d+m".toRegex(), "").let {
+    it.codePointCount(0, it.length)
+}
 
 /*
  * Create our own versions of pad and trim functions. These already exist in

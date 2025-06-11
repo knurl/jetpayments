@@ -4,7 +4,11 @@ import com.hazelcast.core.EntryEvent
 import com.hazelcast.map.listener.EntryAddedListener
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
 /*
  * This class observes the creation of PaymentReceipts, and summarizes these and
@@ -33,28 +37,18 @@ class ReceiptWatcher(
     client: HzCluster.ClientInstance,
     private val numPayments: Int,
     private val merchantMap: Map<String, Merchant>,
-    private val getNumPaymentsReceived: () -> Int,
-) : AutoCloseable {
+    private val getNumIssued: () -> Int,
+) {
     private val logger = ElapsedTimeLogger("Watcher")
     private val paymentReceiptMap =
         client.getMap<Int, PaymentReceipt>(AppConfig.paymentReceiptMapName)
     private val screenWidth: Int = AppConfig.screenWidth
 
     // Data class that tracks the number of receipts processed on a particular node.
-    data class NodeTally(var numProcessed: Int, val onMember: Int)
+    data class NodeTally(val numProcessed: Int, val onMember: Int)
 
     // Public state that reveals which nodes are currently processing receipts.
     val nodesInUse = MutableStateFlow<List<Int>>(emptyList())
-
-    /*
-     * Data structures needed to communicate with the ReceiptsActor, below.
-     */
-    data class Summary(val numReceipts: Int, val receiptSummary: String)
-    sealed class ActorMessage {
-        class Update(val receipt: PaymentReceipt) : ActorMessage()
-        class Summarize() : ActorMessage()
-        class Rebuild() : ActorMessage()
-    }
 
     /*
      * This is a specialized class used to render the per-merchant fields by the
@@ -70,7 +64,7 @@ class ReceiptWatcher(
     class TallyField(
         private val width: Int,
         private val merchant: String,
-        private val tally: List<NodeTally>
+        private val tally: List<NodeTally>,
     ) {
         init {
             require(width >= merchant.numCodepoints() + 2)
@@ -99,6 +93,17 @@ class ReceiptWatcher(
     }
 
     /*
+     * Data structures needed to communicate with the ReceiptsActor, below. ActorMessage
+     * is the input format; Summary is the output format.
+     */
+    sealed class ActorMessage { // input
+        class Update(val receipt: PaymentReceipt) : ActorMessage()
+        class Summarize() : ActorMessage()
+        class Rebuild() : ActorMessage()
+    }
+    data class Summary( val numReceipts: Int, val receiptSummary: String)
+
+    /*
      * Use an actor approach for processing messages and modifying state. Only the
      * actor gets to modify the state encapsulated within this inner class, which
      * avoids mutable shared state. Since the event listener on the PaymentReceipt
@@ -112,11 +117,6 @@ class ReceiptWatcher(
          */
         private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-        // Get rid of scope on close.
-        override fun close() {
-            scope.cancel()
-        }
-
         /*
          * This is where receipts are summarized, in a way that makes it easy to
          * report. We basically group by merchant, and for each merchant, we have a
@@ -125,15 +125,14 @@ class ReceiptWatcher(
          * topology change, then we'll see a switch, in some cases, from processing
          * receipts on one node to processing them on another.
          */
-        private val receiptSummaryMap =
-            sortedMapOf<String, MutableList<NodeTally>>()
+        private val receiptSummaryMap = sortedMapOf<String, List<NodeTally>>()
         private var numReceipts = 0 // How many receipts have we summarized?
 
         // Keep track of the last node that processed each merchant.
         private val nodeLastUsedForMerchant = sortedMapOf<String, Int>()
 
         // This method clears all of the state listed above.
-        fun reset() {
+        private fun reset() {
             receiptSummaryMap.clear()
             numReceipts = 0
             nodeLastUsedForMerchant.clear()
@@ -145,16 +144,16 @@ class ReceiptWatcher(
          * can modify the map, and count receipts, without using a mutex.
          */
         private fun mergeNewReceipt(receipt: PaymentReceipt) {
-            val tally =
-                receiptSummaryMap.getOrPut(receipt.merchantId) { mutableListOf() }
+            val tally = receiptSummaryMap.getOrPut(receipt.merchantId) { listOf() }
             val last = tally.lastOrNull()
-            if (last?.onMember == receipt.onMember) {
-                last.numProcessed++
+            val newTally = if (last?.onMember == receipt.onMember) {
+                tally.dropLast(1) + NodeTally(last.numProcessed + 1, receipt.onMember)
             } else {
                 // Add a new pair if tally is empty or the node is different
-                tally.add(NodeTally(1, receipt.onMember))
                 nodeLastUsedForMerchant[receipt.merchantId] = receipt.onMember
+                tally + NodeTally(1, receipt.onMember)
             }
+            receiptSummaryMap[receipt.merchantId] = newTally
             numReceipts++
         }
 
@@ -167,7 +166,7 @@ class ReceiptWatcher(
             nodesInUse.value = nodeLastUsedForMerchant.values.toList()
 
             // Capture snapshot of changing values from Kotlin mutableStateFlows
-            val metricsSummary = getMetricsSummary(getNumPaymentsReceived())
+            val metricsSummary = getMetricsSummary(getNumIssued())
             val numFields = merchantMap.size
 
             fun generateLogLine(fields: Iterable<String>): String =
@@ -209,97 +208,127 @@ class ReceiptWatcher(
          * the actor. The inFlow is used to send messages to the actor, and the outFlow
          * is used to receive the results of processing messages.
          */
+        private fun rebuild() {
+            reset()
+            paymentReceiptMap.values.groupBy { it.merchantId }
+                .mapValues { (_, receipts) ->
+                    receipts.sorted().map { receipt ->
+                        NodeTally(1, receipt.onMember)
+                    }.combine({ tally1, tally2 ->
+                        tally1.onMember == tally2.onMember
+                    }, { tally1, tally2 ->
+                        tally1.copy(numProcessed = tally1.numProcessed + tally2.numProcessed)
+                    })
+                }.forEach { (merchant, tally) ->
+                    receiptSummaryMap[merchant] = tally
+                    nodeLastUsedForMerchant[merchant] = tally.last().onMember
+                    numReceipts += tally.sumOf { it.numProcessed }
+                }
+        }
 
-        val inFlow =
-            MutableSharedFlow<ActorMessage>(extraBufferCapacity = Channel.UNLIMITED)
+        /*
+         * Hazelcast EntryAddedListener (which derives MapListener) object. Hazelcast
+         * will call into the entryAdded callback method, and that method therefore
+         * needs to completely very quickly and reliably, and cannot suspend. There will
+         * also be multiple simulaneous calls into entryAdded(), so we use a Channel
+         * which is thread-safe.
+         */
+        private val listenerUuid = paymentReceiptMap.addEntryListener(object :
+            EntryAddedListener<Int, PaymentReceipt> {
+            override fun entryAdded(event: EntryEvent<Int, PaymentReceipt>) {
+                inFlow.trySend(ActorMessage.Update(event.value))
+            }
+        }, true)
 
-        val outFlow = flow {
-            var ignoreUpdates = false
-            inFlow.collect { message ->
-                when (message) {
-                    is ActorMessage.Update -> {
-                        if (!ignoreUpdates) mergeNewReceipt(message.receipt)
+        private val inFlow = Channel<ActorMessage>(Channel.UNLIMITED)
+        val outFlow = Channel<Summary>(Channel.CONFLATED)
+
+        init {
+            scope.launch {
+                for (message in inFlow) {
+                    when (message) {
+                        is ActorMessage.Update -> mergeNewReceipt(message.receipt)
+                        is ActorMessage.Summarize -> outFlow.send(summarize())
+                        is ActorMessage.Rebuild -> rebuild()
                     }
+                }
+            }
+        }
 
-                    is ActorMessage.Summarize -> {
-                        emit(summarize())
-                    }
+        suspend fun send(message: ActorMessage) = inFlow.send(message)
 
-                    is ActorMessage.Rebuild -> {
-                        ignoreUpdates = true
-                        reset()
-                        paymentReceiptMap.values.sorted().forEach { receipt ->
-                            mergeNewReceipt(receipt)
+        override fun close() {
+            paymentReceiptMap.removeEntryListener(listenerUuid)
+            inFlow.close()
+            outFlow.close()
+            scope.cancel()
+        }
+    } // end of class ReceiptsActor()
+
+    class Heartbeat {
+        private var lastHeartbeat = TimeSource.Monotonic.markNow()
+        fun beat() { lastHeartbeat = TimeSource.Monotonic.markNow() }
+        fun hasElapsed(duration: Duration) = lastHeartbeat.elapsedNow() >= duration
+    }
+
+    val heartbeat = Heartbeat()
+
+    suspend fun startReceiptsLog() = coroutineScope {
+        val heartbeatJob = launch {
+            while (true) {
+                if (heartbeat.hasElapsed(20.seconds)) {
+                    throw IllegalStateException("Heartbeat has expired!")
+                }
+                delay(5.seconds)
+            }
+        }
+
+        ReceiptsActor().use { receiptsActor ->
+            val summarizeJob = launch {
+                while (true) {
+                    delay(AppConfig.reportFrequency)
+                    receiptsActor.send(ActorMessage.Summarize())
+                }
+            }
+
+            /* Keep track of the 2nd-latest and latest reports of the number of receipts
+             * in the payments summary map, as well as the latest receiptSummary string,
+             * using a scan() function that traverses the output from the receiptsActor.
+             */
+            receiptsActor.outFlow.consumeAsFlow().scan(
+                Triple(0, 0, "")
+            ) { (_, current, _), (numReceipts, receiptSummary) ->
+                Triple(current, numReceipts, receiptSummary)
+            }.drop(1).onEach { (lastNumReceipts, numReceipts, receiptSummary) ->
+                if (lastNumReceipts != numReceipts) {
+                    logger.log(receiptSummary)
+                    heartbeat.beat()
+                }
+            }.takeWhile { (_, numReceipts, _) -> numReceipts < numPayments }
+                .onCompletion {
+                    summarizeJob.cancel()
+                    logger.log("summarizeJob cancelled")
+                }.filter { (lastNumReceipts, numReceipts, _) ->
+                    lastNumReceipts == numReceipts // no change in reported value
+                }.collect {
+                    /* If we've gotten here, then the receipt count isn't advancing,
+                     * which has happened because we've missed some MapListener events
+                     * (they're not guaranteed during cluster topology changes). If all
+                     * payments have been issued, indicating the end of the run, force a
+                     * rebuild of our data from the source map.
+                     */
+                    if (getNumIssued() >= numPayments) {
+                        logger.log("Rebuilding receipts summary map")
+                        receiptsActor.run {
+                            send(ActorMessage.Rebuild())
+                            send(ActorMessage.Summarize())
                         }
                     }
                 }
-            }
-
-            /* We need to replay 1 value to new collectors, because we're going to
-             * send a final Summarize message to the actor at the end and a new
-             * collector will fetch the result.
-             */
-        }.shareIn(scope, SharingStarted.Eagerly, 1)
-    } // end of class ReceiptsActor()
-
-    private val receiptsActor = ReceiptsActor() // Create the singleton.
-
-    /*
-     * Hazelcast EntryAddedListener (which derives MapListener) class. Hazelcast
-     * will call into the entryAdded callback method, and that method therefore
-     * needs to completely very quickly and reliably, and therefore it cannot
-     * suspend. There will also be multiple calls simultaneously into entryAdded()
-     * so we must use shared state in a thread-safe manner. We send each collected
-     * event to a channel using trySend (this is threadsafe) which will make a
-     * single attempt and always return.
-     */
-    private class ReceiptListener(
-        private val actorFlow: MutableSharedFlow<ActorMessage>,
-    ) : EntryAddedListener<Int, PaymentReceipt> {
-        override fun entryAdded(event: EntryEvent<Int, PaymentReceipt>) {
-            actorFlow.tryEmit(ActorMessage.Update(event.value))
         }
-    }
 
-    /* Register the EntryAddedListener with our payment receipt map.
-     */
-    private val listener = ReceiptListener(receiptsActor.inFlow)
-    private val listenerUUID = paymentReceiptMap.addEntryListener(listener, true)
+        heartbeatJob.cancel()
 
-    override fun close() {
-        paymentReceiptMap.removeEntryListener(listenerUUID)
-        receiptsActor.close()
-    }
-
-    private suspend fun receiptsSummaryPoll() = with(receiptsActor.inFlow) {
-        while (true) {
-            delay(AppConfig.reportFrequency)
-            emit(ActorMessage.Summarize())
-        }
-    }
-
-    suspend fun startReceiptsLog() = coroutineScope {
-        var previousNumReceipts = 0
-        launch { receiptsSummaryPoll() }
-
-        receiptsActor.outFlow.onEach { (_, receiptSummary) ->
-            receiptSummary.let { if (it.isNotEmpty()) logger.log(it) }
-        }.takeWhile { (numReceipts, _) -> numReceipts < numPayments }.onCompletion {
-            this@coroutineScope.cancel()
-        }.collect { (numReceipts, _) ->
-            /* NOTE: Hazelcast MapListener Events are not treated as highly
-             * available from a Hazelcast perspective, and as we are bringing nodes
-             * down, we might miss a few messages. If it seems that our receipt
-             * count isn't advancing at the end of the process, rebuild our data
-             * from the source map.
-             */
-            if (numReceipts == previousNumReceipts && getNumPaymentsReceived() == numPayments) {
-                with(receiptsActor.inFlow) {
-                    emit(ActorMessage.Rebuild())
-                    emit(ActorMessage.Summarize())
-                }
-            }
-            previousNumReceipts = numReceipts
-        }
+        logger.log("Receipts log job concluded")
     }
 }

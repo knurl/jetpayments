@@ -29,15 +29,15 @@ class PaymentsJetPipeline(
 
     override fun describePipeline(): String {
         return """
-           This Jet pipeline consumes payment requests in JSON format from the
-           Kafka stream source, maps them from JSON to a payment request
-           object, and uses a groupingKey to distribute the payment requests across
-           the nodes according to merchant ID. The node responsible for the given
-           merchant then transfers its assigned payment requests to its local
-           payment processing service for payment. That service completes the
-           payment after a random delay (simulating the processing of the payment
-           IRL), and returns a receipt. The receipt is then stored in the payment
-           receipt map.
+           This Jet pipeline consumes payment requests in JSON format from
+           Kafka, maps them from JSON to a payment request object, and uses a
+           groupingKey to distribute the payment requests across the nodes
+           according to merchant ID. The node assigned for the given merchant
+           then uses its local payment processing service to process the
+           merchant's payments. That service completes the payment after a
+           random delay (simulating a real payment processing service), and
+           returns a payment receipt. The receipt is then stored in the 
+           payment receipt map.
            """.trimIndent()
     }
 
