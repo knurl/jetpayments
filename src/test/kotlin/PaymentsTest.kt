@@ -4,7 +4,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.flow.*
+import kotlinx.serialization.json.Json
 import org.hazelcast.jetpayments.*
+import org.hazelcast.jetpayments.PaymentRequest
 import java.util.*
 import kotlin.math.absoluteValue
 import kotlin.time.Duration.Companion.seconds
@@ -64,20 +66,21 @@ class PaymentsTest : FunSpec({
             val checkFlow = produce(
                 context = Dispatchers.IO, capacity = Channel.UNLIMITED
             ) {
-                PaymentGenerator(seededRandom).newPaymentRequestFlow()
-                    .take(numPayments)
+                PaymentGenerator(seededRandom).newPaymentRequestFlow().take(numPayments)
                     .onEach { pmtreq ->
                         send(pmtreq)
-                    }.map { pmtreq -> pmtreq.toJsonString() }
-                    .collect { serializedPayment ->
-                        kafka.publish(serializedPayment)
+                    }.map { pmtreq ->
+                        Json.Default.encodeToString<PaymentRequest>(pmtreq)
+                    }.collect { jsonPaymentRequest ->
+                        kafka.publish(jsonPaymentRequest)
                     }
             }.consumeAsFlow()
 
-            kafka.consume(consumerGroup) { serializedPayment -> serializedPayment.toPaymentRequest() }
-                .take(numPayments).zip(checkFlow) { pmtReq, checkPmtReq ->
-                    pmtReq to checkPmtReq
-                }.filter { (pmtReq, checkPmtReq) -> pmtReq != checkPmtReq }
+            kafka.consume(consumerGroup) { serializedPayment ->
+                Json.Default.decodeFromString<PaymentRequest>(serializedPayment)
+            }.take(numPayments).zip(checkFlow) { pmtReq, checkPmtReq ->
+                pmtReq to checkPmtReq
+            }.filter { (pmtReq, checkPmtReq) -> pmtReq != checkPmtReq }
                 .collect { (pmtReq, checkPmtReq) ->
                     fail("Payment mismatch: $pmtReq $checkPmtReq")
                 }
@@ -161,12 +164,11 @@ class PaymentsTest : FunSpec({
         val requestChannel = produce(
             context = Dispatchers.IO, capacity = Channel.UNLIMITED
         ) {
-            getPaymentFlow().take(numPayments)
-                .collect { (payreq, receipt) ->
-                    paymentReceiptMap.put(receipt.paymentId, receipt)
-                    send(payreq)
-                    numWritten.value++
-                }
+            getPaymentFlow().take(numPayments).collect { (payreq, receipt) ->
+                paymentReceiptMap.put(receipt.paymentId, receipt)
+                send(payreq)
+                numWritten.value++
+            }
         }
 
         while (numWritten.value < numPayments) {
@@ -270,11 +272,10 @@ class PaymentsTest : FunSpec({
         val receiptSummary = ReceiptSummary()
         paymentReceiptMap.clear()
 
-        getPaymentFlow().take(numPayments).map { it.second }
-            .collect { receipt ->
-                paymentReceiptMap.put(receipt.paymentId, receipt)
-                receiptSummary.addReceipt(receipt)
-            }
+        getPaymentFlow().take(numPayments).map { it.second }.collect { receipt ->
+            paymentReceiptMap.put(receipt.paymentId, receipt)
+            receiptSummary.addReceipt(receipt)
+        }
 
         data class ReceiptSummaryCapture(
             val numReceipts: Int,

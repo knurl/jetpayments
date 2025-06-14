@@ -4,6 +4,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.take
+import kotlinx.serialization.json.Json
 import kotlin.time.Duration.Companion.milliseconds
 
 /*
@@ -104,12 +105,12 @@ class PaymentsRun() : AutoCloseable {
         /* Create a flow of numPayments randomly-generated payments with
          * inbuilt delays simulating the delays with real payments coming in.
          */
-        paymentGenerator.newPaymentRequestFlow().take(numPayments)
-            .map { paymentReq -> paymentReq.toJsonString() }
-            .collect { serializedPaymentReq ->
-                kafka.publish(serializedPaymentReq)
-                countNewPayment() // Count new payment sent to Kafka
-            }
+        paymentGenerator.newPaymentRequestFlow().take(numPayments).map { paymentReq ->
+            Json.Default.encodeToString<PaymentRequest>(paymentReq)
+        }.collect { jsonPaymentRequest ->
+            kafka.publish(jsonPaymentRequest)
+            countNewPayment() // Count new payment sent to Kafka
+        }
     }
 
     // Show that everything got paid correctly (and some stats).
