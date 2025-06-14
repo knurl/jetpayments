@@ -2,6 +2,8 @@ package org.hazelcast.jetpayments
 
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.take
 import kotlin.time.Duration.Companion.milliseconds
 
 /*
@@ -32,9 +34,14 @@ class PaymentsRun() : AutoCloseable {
     private val kafkaProcessCG = AppConfig.kafkaProcessPaymentsCG.uniqify()
     private val kafkaVerifyCG = AppConfig.kafkaVerifyPaymentsCG.uniqify()
 
-    // Create the list of merchants we'll use throughout the payment runs.
+    // Create the list of merchants we'll use throughout the payment run.
     private val merchantMap =
         MerchantGenerator(AppConfig.numMerchants, seededRandom).merchantMap
+
+    // Create a PaymentGenerator that will synthesise new PaymentRequests for us.
+    private val paymentGenerator = PaymentGenerator(
+        seededRandom, merchantMap
+    ) { nextPaymentRequestDelay() }
 
     private fun calculateNumPayments(numFailureCycles: Int): Int {
         val failureTime = AppConfig.failureCycleTime * numFailureCycles
@@ -92,21 +99,15 @@ class PaymentsRun() : AutoCloseable {
     // Take the payments from our payments generator, and publish them to Kafka.
     private suspend fun issuePaymentsToKafka(
         numPayments: Int, countNewPayment: () -> Unit
-    ) {/*
-         * Create a sequence of numPayments randomly-generated payments. Inject
-         * delays into the stream as well.
-         */
-        val paymentRequestSeq =
-            PaymentGenerator(seededRandom, merchantMap).newPaymentRequestSeq()
-        val delaySeq = generateSequence { paymentRequestDelayNext() }
+    ) {
 
-        (paymentRequestSeq zip delaySeq).take(numPayments)
-            .forEach { (paymentReq, issueDelay) ->
-                // Timestamp and publish each payment, and delay afterward
-                paymentReq.copy(timeIssued = Epoch.timeNow()).let { stampedPayment ->
-                    kafka.publish(stampedPayment.toJsonString())
-                }
-                delay(issueDelay) // Simulate delay
+        /* Create a flow of numPayments randomly-generated payments with
+         * inbuilt delays simulating the delays with real payments coming in.
+         */
+        paymentGenerator.newPaymentRequestFlow().take(numPayments)
+            .map { paymentReq -> paymentReq.toJsonString() }
+            .collect { serializedPaymentReq ->
+                kafka.publish(serializedPaymentReq)
                 countNewPayment() // Count new payment sent to Kafka
             }
     }
@@ -123,7 +124,7 @@ class PaymentsRun() : AutoCloseable {
         Canvas(paid + byMerchant + uptimeSpans).draw().log(logger)
     }
 
-    internal fun validationCheck(
+    private fun validationCheck(
         test: Boolean, succeedMsg: String, failedMsg: String
     ) = (if (test) "CHECK SUCCEEDED: $succeedMsg"
     else "CHECK FAILED: $failedMsg").let {
@@ -241,7 +242,7 @@ class PaymentsRun() : AutoCloseable {
             launch { issuePaymentsToKafka(numPayments) { numIssued.value++ } }
             // A service that monitors completed receipts, summarizes and logs them.
             ReceiptWatcher(client, numPayments, merchantMap) { numIssued.value }
-        }.let { watcher ->
+        }.use { watcher ->
 
             // A service that simulates failures of individual nodes in the cluster.
             val failSim = FailureSimulator(client) { watcher.nodesInUse.value }

@@ -34,6 +34,6 @@ data class PaymentReceipt(
         memberIndex
     )
 
-    override fun compareTo(other: PaymentReceipt) =
+    override fun compareTo(other: PaymentReceipt): Int =
         this.timePaid.compareTo(other.timePaid)
 }

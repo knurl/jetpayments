@@ -74,9 +74,9 @@ class HzCluster(
     inner class ClientInstance(
         private val hzClientInstance: HazelcastInstance
     ) : HazelcastInstance by hzClientInstance, AutoCloseable {
-        val originalClusterSize get() = this@HzCluster.originalClusterSize
+        val originalClusterSize: Int get() = this@HzCluster.originalClusterSize
         val size: Int get() = hzClientInstance.cluster.members.size
-        val membershipListener = ClientMembershipListener(originalClusterSize)
+        val membershipListener: ClientMembershipListener = ClientMembershipListener(originalClusterSize)
 
         init {
             hzClientInstance.cluster.addMembershipListener(membershipListener)
@@ -101,7 +101,7 @@ class HzCluster(
         }
 
         // Bring a member down
-        suspend fun shutdownMember(memberToKill: Int) =
+        suspend fun shutdownMember(memberToKill: Int): Unit =
             withContext(Dispatchers.Default) {
                 require(size > 1) { "Can't kill a member in a one-member cluster!" }
                 val memberArray = memberArrayDeferred.await()
@@ -122,7 +122,7 @@ class HzCluster(
             }
 
         // Restart a down member (bring it back up)
-        suspend fun restartMember(memberToRestart: Int) =
+        suspend fun restartMember(memberToRestart: Int): Unit =
             withContext(Dispatchers.Default) {
                 require(size < originalClusterSize) { "Can't restart a member in fully running cluster!" }
                 val memberArray = memberArrayDeferred.await()

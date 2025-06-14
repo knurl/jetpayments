@@ -20,5 +20,5 @@ data class PaymentRequest(
     val merchantName: String,
 ) : java.io.Serializable
 
-fun String.toPaymentRequest() = Json.Default.decodeFromString<PaymentRequest>(this)
+fun String.toPaymentRequest(): PaymentRequest = Json.Default.decodeFromString<PaymentRequest>(this)
 fun PaymentRequest.toJsonString(): String = Json.Default.encodeToString(this)

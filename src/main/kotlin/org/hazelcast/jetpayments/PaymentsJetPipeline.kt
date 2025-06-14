@@ -41,7 +41,7 @@ class PaymentsJetPipeline(
            """.trimIndent()
     }
 
-    override val pipeline = Pipeline.create().apply {
+    override val pipeline: Pipeline = Pipeline.create().apply {
         readFrom(streamSource).withoutTimestamps().map { entry ->
             entry.value.toPaymentRequest() // convert JSON string to payment req
         }.groupingKey { it.merchantId } /* distribute/group by merchant ID */
@@ -58,6 +58,6 @@ class PaymentsJetPipeline(
             )
     }
 
-    override fun unitsLeft() =
+    override fun unitsLeft(): Int =
         (numPayments - paymentReceiptMap.size).coerceAtLeast(0)
 }

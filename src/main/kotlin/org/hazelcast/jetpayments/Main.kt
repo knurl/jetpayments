@@ -48,10 +48,11 @@ internal object AppConfig {
 
     // Following items generally needn't be changed. Modify with care!
     val steadyStateTime = 30.seconds
-    val jetMeanRescheduleTime = 10.seconds
+    private val jetMeanRescheduleTime = 10.seconds
     val failureCycleTime = (steadyStateTime + jetMeanRescheduleTime) * 2
     val jetStateHistorySize = 4
     val logPrefixLen = 24
+    val displayWidth = screenWidth - logPrefixLen
 }
 
 internal val explainer = bold("EXPLAINER") + """
@@ -69,13 +70,25 @@ internal val explainer = bold("EXPLAINER") + """
         towards the left, as the newly scheduled node appears on the right.
     """
 
+internal fun getJavaParams(): List<String> {
+    return buildList {
+        add(System.getProperty("java.vm.name"))
+        add(System.getProperty("java.vendor"))
+        add(System.getProperty("java.version"))
+    }.let { list ->
+        TextBox(list).center().addBorder().toStrings()
+    }
+}
+
 // Main entry point. This is where the PaymentsRun is started.
 fun main() {
-    // Display a helpful explainer about this demo.
-    TextBox(
+    val logger = ElapsedTimeLogger("Main")
+
+    // Show which VM we're using; display a helpful explainer about this demo.
+    logger.log(getJavaParams())
+    logger.log(TextBox(
         text = explainer.lines(), borderStyle = TextBox.BorderStyle.DOUBLE
-    ).rewrap(AppConfig.screenWidth - AppConfig.logPrefixLen)
-        .log(ElapsedTimeLogger("Main"))
+    ).rewrap(AppConfig.screenWidth - AppConfig.logPrefixLen).toStrings())
 
     /* Start the PaymentsRun demo. Simulate two down/up failure cycles. runBlocking
      * is used to bridge between coroutines and the main thread. It will suspend
@@ -86,12 +99,12 @@ fun main() {
     }
 }
 
-internal fun paymentRequestDelayNext() = paymentRequestDelayRand.getValue().milliseconds
+internal fun nextPaymentRequestDelay() = paymentRequestDelayRand.getValue().milliseconds
 
-internal fun paymentProcessingDelayNext() =
+internal fun nextPaymentProcessingDelay() =
     paymentProcessingDelayRand.getValue().milliseconds
 
-internal fun paymentAmountNext() = paymentAmountRand.getValue().absoluteValue
+internal fun nextPaymentAmount() = paymentAmountRand.getValue().absoluteValue
 
 /*
  * Randomness -> We want a single seed that we choose once, for all randomness
@@ -235,4 +248,4 @@ internal fun String.trimStart(length: Int): String {
     else this.substring(this.offsetByCodePoints(0, numCodepoints - length))
 }
 
-fun tabsToSpaces(s: String) = s.replace("\t", "    ")
+fun tabsToSpaces(s: String): String = s.replace("\t", "    ")

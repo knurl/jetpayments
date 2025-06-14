@@ -7,9 +7,9 @@ plugins {
 group = "org.hazelcast"
 version = "1.0"
 
-val javaVersion = 21
-val kotlinVersion = "2.1.21" // can't substitute in plugins section above
-val hazelcastVersion = "5.5.0"
+private val javaVersion = 21
+private val kotlinVersion = "2.1.21" // can't substitute in plugins section above
+private val hazelcastVersion = "5.5.0"
 
 repositories {
     mavenCentral()
@@ -24,7 +24,11 @@ repositories {
 }
 
 dependencies {
-    testImplementation(kotlin("test"))
+    testImplementation("io.kotest:kotest-runner-junit5:5.8.0")
+    testImplementation("io.kotest:kotest-assertions-core:5.8.0")
+    testImplementation("io.kotest:kotest-property:5.8.0")
+    // For testing coroutines
+    testImplementation("io.kotest:kotest-assertions-core-jvm:5.8.0")
 
     /*
      * Core kotlin libs. We'll need these on all Hazelcast members when using Jet.
@@ -48,6 +52,20 @@ dependencies {
 
 application {
     mainClass.set("org.hazelcast.jetpayments.MainKt")
+}
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
+    compilerOptions {
+        allWarningsAsErrors = true
+        progressiveMode = true
+        freeCompilerArgs.addAll(listOf(
+            "-Xjsr305=strict",
+        ))
+    }
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
 }
 
 java {

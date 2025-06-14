@@ -22,7 +22,7 @@ abstract class JetPipeline(
     private val client: HzCluster.ClientInstance,
     private val jobName: String,
 ) : AutoCloseable {
-    protected val logger = ElapsedTimeLogger("JetPipeline")
+    private val logger = ElapsedTimeLogger("JetPipeline")
     private var jetJob: HzJob? = null
     private val jetJobStateFlow = MutableStateFlow(JobStatus.RUNNING)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -47,7 +47,7 @@ abstract class JetPipeline(
         object WaitingForJetToAddNode : JetSchedulerState()
 
         companion object {
-            val initialState = Running as JetSchedulerState
+            val initialState: JetSchedulerState = Running as JetSchedulerState
         }
 
         override fun toString(): String = this::class.simpleName ?: super.toString()
@@ -116,7 +116,7 @@ abstract class JetPipeline(
      * by rebalancing work to exclude the failed node or add in the recovered
      * node.
      */
-    val jetSchedulerStateFlow =
+    val jetSchedulerStateFlow: StateFlow<JetSchedulerState> =
         jetStateFlow.scan(JetSchedulerState.initialState) { state, jetState ->
             state.transition(
                 jetState.jobStatus == JobStatus.RUNNING,

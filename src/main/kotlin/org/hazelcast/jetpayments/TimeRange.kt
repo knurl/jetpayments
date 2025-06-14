@@ -40,16 +40,18 @@ internal class TimeRange(
  * Generalized function for combining a list of items into a condensed list.
  */
 internal fun <T> List<T>.combine(
-    combinable: (T, T) -> Boolean,
-    combineFun: (T, T) -> T,
+    isCombinable: (T, T) -> Boolean,
+    combineWith: (T, T) -> T,
 ): List<T> {
     if (this.isEmpty()) return emptyList()
-    return this.fold(mutableListOf(this.first())) { acc, curr ->
+    val initial = mutableListOf(this.first())
+    val rest = this.drop(1)
+    return rest.fold(initial) { acc, curr ->
         acc.apply {
             val last = last()
-            val toAdd = if (combinable(last, curr)) {
+            val toAdd = if (isCombinable(last, curr)) {
                 removeLast()
-                combineFun(last, curr)
+                combineWith(last, curr)
             } else curr
             add(toAdd)
         }

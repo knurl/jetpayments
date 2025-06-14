@@ -4,6 +4,7 @@ import com.google.common.math.IntMath.pow
 import com.hazelcast.jet.kafka.KafkaSources
 import com.hazelcast.jet.pipeline.StreamSource
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.future.await
 import org.apache.kafka.clients.admin.AdminClient
@@ -104,9 +105,7 @@ class KafkaCluster<K, V>(
      * Create a Kotlin Flow for consuming from the topic, waiting for topic to be
      * created first.
      */
-    fun <T> consume(
-        consumerGroup: String, convert: (V) -> T,
-    ) = flow {
+    fun <T> consume(consumerGroup: String, convert: (V) -> T): Flow<T> = flow {
         topicCreateJob.join()
         KafkaConsumer<K, V>(consumerPropsWithCG(consumerGroup)).use { consumer ->
             val timeout = AppConfig.kafkaPollTimeout.toJavaDuration()
