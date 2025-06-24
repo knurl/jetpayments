@@ -76,7 +76,6 @@ internal fun getJavaParams(): List<String> {
         "java.vm.name",
         "java.vendor",
         "java.version",
-        "java.vm.specification.name",
     ).map { it to "$it: " }
 
     val longest = params.maxOf { it.second.length }
