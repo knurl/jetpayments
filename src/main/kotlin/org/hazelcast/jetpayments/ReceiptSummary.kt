@@ -47,7 +47,7 @@ internal class ReceiptSummary {
             tallyList.lastOrNull()?.onMember
         }.toSet()
 
-    fun rebuildFromMap(paymentReceiptMap: IMap<Int, PaymentReceipt>) {
+    fun rebuildFromMap(paymentReceiptMap: IMap<Int, PaymentReceipt>): Int {
         receiptSummaryMap.clear()
         numReceipts = 0
 
@@ -65,5 +65,7 @@ internal class ReceiptSummary {
             receiptSummaryMap[merchant] = tallyList
             numReceipts += tallyList.sumOf { it.numProcessed }
         }
+
+        return numReceipts
     }
 }

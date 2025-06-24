@@ -5,6 +5,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.take
 import kotlinx.serialization.json.Json
+import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.milliseconds
 
 /*
@@ -32,8 +33,8 @@ class PaymentsRun() : AutoCloseable {
     // Spin up Kafka
     private val kafkaTopicName = AppConfig.kafkaTopicName.uniqify()
     private val kafka = KafkaCluster<Int, String>(kafkaTopicName, 0)
-    private val kafkaProcessCG = AppConfig.kafkaProcessPaymentsCG.uniqify()
-    private val kafkaVerifyCG = AppConfig.kafkaVerifyPaymentsCG.uniqify()
+    private val kafkaProcessConsumerGroup = AppConfig.kafkaProcessPaymentsCG.uniqify()
+    private val kafkaVerifyConsumerGroup = AppConfig.kafkaVerifyPaymentsCG.uniqify()
 
     // Create the list of merchants we'll use throughout the payment run.
     private val merchantMap =
@@ -44,11 +45,8 @@ class PaymentsRun() : AutoCloseable {
         seededRandom, merchantMap
     ) { nextPaymentRequestDelay() }
 
-    private fun calculateNumPayments(numFailureCycles: Int): Int {
-        val failureTime = AppConfig.failureCycleTime * numFailureCycles
-        val totalTime = AppConfig.warmupTime + failureTime + AppConfig.cooldownTime
-        return (totalTime / AppConfig.paymentRequestDelayRand.mean.milliseconds).toInt()
-    }
+    private fun calculateNumPayments(numFailureCycles: Int): Int =
+        ((AppConfig.warmupTime + AppConfig.failureCycleTime * numFailureCycles + AppConfig.cooldownTime) / AppConfig.paymentRequestDelayRand.mean.milliseconds).roundToInt()
 
     // Display our key parameters at the start of this payments run.
     private suspend fun showPaymentRunParameters(
@@ -145,7 +143,7 @@ class PaymentsRun() : AutoCloseable {
          */
         PaymentProcessedCheckPipeline(
             hzClientDeferred.await(),
-            kafka.consumerJetSource(kafkaVerifyCG),
+            kafka.consumerJetSource(kafkaVerifyConsumerGroup),
             numPayments
         ).use { it.runUntilCompleted() }
 
@@ -232,37 +230,40 @@ class PaymentsRun() : AutoCloseable {
      * some degree of cooperation and planning to work, but Kotlin provides
      * language support for understanding and managing coroutine concurrency.
      */
-    internal suspend fun run(numFailureCycles: Int) = withContext(Dispatchers.Default) {
-        val client = hzClientDeferred.await()
-        val numPayments = calculateNumPayments(numFailureCycles)
-        showPaymentRunParameters(numFailureCycles, numPayments)
+    internal suspend fun run(numFailureCycles: Int) {
+        withContext(Dispatchers.Default) {
+            val client = hzClientDeferred.await()
+            val numPayments = calculateNumPayments(numFailureCycles)
+            showPaymentRunParameters(numFailureCycles, numPayments)
 
-        // Create a counter for the number of payments we've issued.
-        MutableStateFlow(0).let { numIssued ->
-            // First start the payments flow into Kafka, from which Jet will read
-            launch { issuePaymentsToKafka(numPayments) { numIssued.value++ } }
-            // A service that monitors completed receipts, summarizes and logs them.
-            ReceiptWatcher(client, numPayments, merchantMap) { numIssued.value }
-        }.use { watcher ->
+            // Create a counter for the number of payments we've issued.
+            MutableStateFlow(0).let { numIssued ->
+                // First start the payments flow into Kafka, from which Jet will read
+                launch { issuePaymentsToKafka(numPayments) { numIssued.value++ } }
+                // A service that monitors completed receipts, summarizes and logs them.
+                ReceiptWatcher(client, numPayments, merchantMap) { numIssued.value }
+            }.use { watcher ->
+                // A service that simulates failures of individual nodes in the cluster.
+                val failSim = FailureSimulator(client) { watcher.nodesInUse.value }
 
-            // A service that simulates failures of individual nodes in the cluster.
-            val failSim = FailureSimulator(client) { watcher.nodesInUse.value }
+                // Read from Kafka, distribute to members, process payments
+                val streamSource = kafka.consumerJetSource(kafkaProcessConsumerGroup)
+                PaymentsJetPipeline(client, streamSource, numPayments).use { pipeline ->
+                    logger.log(pipeline.summarize()) // Helpful info
+                    launch { pipeline.run() } // Start Jet streaming pipeline.
 
-            // Read from Kafka, distribute to members, process payments
-            PaymentsJetPipeline(
-                client, kafka.consumerJetSource(kafkaProcessCG), numPayments
-            ).use { pipeline ->
-                launch { pipeline.run() } // Start Jet streaming pipeline.
-
-                coroutineScope {
-                    launch { watcher.startReceiptsLog() }
-                    async {
-                        failSim.runSimulations(
-                            pipeline.jetSchedulerStateFlow, pipeline::hasTimeLeft
-                        )
+                    coroutineScope {
+                        launch { watcher.startReceiptsLog() }
+                        async {
+                            failSim.runSimulations(
+                                pipeline.jetSchedulerStateFlow
+                            ) { timeLeft -> pipeline.hasTimeLeft(timeLeft) }
+                        }
                     }
-                }.await()
-            } // We hit close() on pipeline, which stops the Jet job.
-        }.also { uptimeSpans -> verifyPayments(numPayments, uptimeSpans) }
+                } // We hit close() on pipeline, which stops the Jet job.
+            }.also { uptimeSpans ->
+                verifyPayments(numPayments, uptimeSpans.await())
+            }
+        }
     }
 }

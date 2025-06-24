@@ -29,7 +29,7 @@ internal class TallyField(
         }
         val last = tally.lastOrNull()?.let {
             "${fontEtched(it.onMember)}×${underline(it.numProcessed.toString())}"
-        } ?: "NONE YET"
+        } ?: "∅"
         val ticker = (allButLast + last).joinToString(" → ")
         return if (ticker.numCodepoints() > widthLeft) { // too big for field
             "$merchant⋯${ticker.trimStart(widthLeft - 1)}"

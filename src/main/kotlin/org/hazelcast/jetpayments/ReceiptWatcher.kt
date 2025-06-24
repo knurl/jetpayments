@@ -4,7 +4,10 @@ import com.hazelcast.core.EntryEvent
 import com.hazelcast.map.IMap
 import com.hazelcast.map.listener.EntryAddedListener
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.Channel.Factory.RENDEZVOUS
+import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.flow.*
 import kotlin.time.Duration
 
@@ -53,14 +56,16 @@ class ReceiptWatcher(
      * the ReceiptMessage sealed class.
      */
     private class ReceiptsActor(
-        private val numPayments: Int, private val merchantMap: Map<String, Merchant>
-    ) : AutoCloseable,
-        Channel<ReceiptsActor.Message> by Channel<Message>(Channel.UNLIMITED) {
+        private val numPayments: Int, private val merchantMap: Map<String, Merchant>,
+    ): Actor<ReceiptsActor.Message>() {
         private val receiptSummary = ReceiptSummary()
+        private var attemptingRebuild = false
 
         // Used when we summarize the state of the ReceiptSummary map to callers
         data class Summary(
-            val numReceipts: Int, val nodesInUse: Set<Int>, val summaryString: String
+            val numReceipts: Int = 0,
+            val nodesInUse: Set<Int> = emptySet(),
+            val summaryString: String = "",
         )
 
         /*
@@ -70,43 +75,42 @@ class ReceiptWatcher(
             class Update(val receipt: PaymentReceipt) : Message()
 
             class Summarize(
-                val numIssued: Int, val outbox: MutableSharedFlow<Summary>
+                val numIssued: Int, val replyFlow: MutableSharedFlow<Summary>,
             ) : Message()
 
-            class Rebuild(val paymentReceiptMap: IMap<Int, PaymentReceipt>) : Message()
+            class Rebuild(
+                val paymentReceiptMap: IMap<Int, PaymentReceipt>,
+                val replyChannel: SendChannel<Int>,
+            ) : Message()
         }
 
         /*
          * Methods to perform input/output to Actor from outside
          */
-        private suspend fun processMessages() {
-            for (message in this) {
-                when (message) {
-                    is Message.Update -> receiptSummary.addReceipt(message.receipt)
-                    is Message.Summarize -> message.outbox.emit(summarize(message.numIssued))
-                    is Message.Rebuild -> receiptSummary.rebuildFromMap(message.paymentReceiptMap)
+        override suspend fun processMessage(message: Message) {
+            when (message) {
+                is Message.Update -> {
+                    if (!attemptingRebuild) {
+                        receiptSummary.addReceipt(message.receipt)
+                    }
+                }
+
+                is Message.Summarize -> {
+                    val summary = summarize(message.numIssued)
+                    message.replyFlow.emit(summary)
+                }
+
+                is Message.Rebuild -> {
+                    attemptingRebuild = true
+                    val response =
+                        receiptSummary.rebuildFromMap(message.paymentReceiptMap)
+                    message.replyChannel.send(response)
                 }
             }
         }
 
-        val scope = CoroutineScope(Dispatchers.Default).run {
-            launch {
-                processMessages()
-            }
-        }
-
-        override fun close() {
-            scope.cancel()
-        }
-
-        /*
-         * Generate the initial part of the receipt summary, consisting of rolling
-         * metrics. QUD = queued payments, WKG = in-process payments, FIN = finished
-         * payments.
-         */
-        private fun getMetricsSummary(numIssued: Int): String {
+        private fun summarize(numIssued: Int): Summary {
             val numReceipts = receiptSummary.numReceipts
-
             val widest = numPayments.toString().length // numPayments is biggest
             val metrics = mapOf(
                 "QUD" to numPayments - numIssued,
@@ -115,16 +119,7 @@ class ReceiptWatcher(
             ).entries.joinToString(" ⇒ ") { (name, value) ->
                 "${value.toString().padStart(widest, '0')} $name"
             }
-
-            return "[$metrics]➣"
-        }
-
-        /*
-         * This function is only ever called, like the previous one, by the actor,
-         * so the mutable state isn't shared, and we don't need a mutex.
-         */
-        private fun summarize(numIssued: Int): Summary {
-            val metricsSummary = getMetricsSummary(numIssued)
+            val metricsSummary = "[$metrics]➣"
             fun generateLogLine(fields: Iterable<String>): String =
                 "$metricsSummary⟦ ${fields.joinToString(" | ")} ⟧"
 
@@ -149,9 +144,13 @@ class ReceiptWatcher(
                 generateLogLine(merchantFields)
             )
         }
-    }
+    } // end of class ReceiptsActor
 
     private val receiptsActor = ReceiptsActor(numPayments, merchantMap)
+
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob()).apply {
+        receiptsActor.start(this)
+    }
 
     /*
      * Hazelcast EntryAddedListener (which derives MapListener) object. Hazelcast
@@ -170,7 +169,33 @@ class ReceiptWatcher(
 
     override fun close() {
         paymentReceiptMap.removeEntryListener(listenerUuid)
+        scope.cancel()
     }
+
+    private suspend fun rebuildFromReceiptMap(numReceipts: Int) {
+        val numLost = numPayments - numReceipts
+        logger.log(italic("$numLost EntryAdded events lost during cluster topology change -> rebuilding from paymentReceiptMap"))
+        Channel<Int>(RENDEZVOUS).let { reply ->
+            receiptsActor.send(
+                ReceiptsActor.Message.Rebuild(paymentReceiptMap, reply)
+            )
+            val numReceiptsFoundInMap = reply.receive()
+            check(numReceiptsFoundInMap == numPayments) { "After rebuild, expected $numPayments receipts, found $numReceiptsFoundInMap" }
+            reply.close()
+        }
+    }
+
+    /*
+     * The outFlow we pass into the ReceiptsActor to receive Summary replies. This must
+     * be a MutableSharedFlow, rather than a MutableStateFlow, as we need our listeners
+     * to be notified even if someone sends the _same_ state to the flow.
+     * MutableStateFlow only notifies listeners when the state changes.
+     */
+    private val outFlow = MutableSharedFlow<ReceiptsActor.Summary>(
+        replay = 0, // Only one listener
+        extraBufferCapacity = 1, // We only need latest version
+        onBufferOverflow = BufferOverflow.DROP_OLDEST, // Sender should never block
+    )
 
     /*
      * Used below to keep track of the most-recent, and 2nd-most-recent
@@ -185,54 +210,49 @@ class ReceiptWatcher(
         val nodesInUse: Set<Int> = emptySet(),
         val summaryString: String = "",
     ) {
-        fun hasUpdated() = lastNumReceipts != numReceipts
+        fun noProgress(): Boolean {
+            return lastNumReceipts != 0 && lastNumReceipts == numReceipts
+        }
     }
 
     suspend fun startReceiptsLog(): Unit = coroutineScope {
-        val outbox = MutableSharedFlow<ReceiptsActor.Summary>(
-            replay = 0, extraBufferCapacity = Channel.UNLIMITED
-        )
-
-        val summarizeJob = launch {
-            while (true) {
-                val msg = ReceiptsActor.Message.Summarize(getNumIssued(), outbox)
+        /* The drumbeat that drives the activity. Send a Summarize request to the actor
+         * on a periodic basis, providing our output flow for replies.
+         */
+        launch {
+            while (isActive) {
+                val msg = ReceiptsActor.Message.Summarize(getNumIssued(), outFlow)
                 receiptsActor.send(msg)
                 delay(reportFrequency)
             }
         }
 
-        /*
-         * Keep track of the 2nd-latest and latest reports of the number
-         * of receipts in the payments summary map, using a scan()
-         * function that traverses the output from the receiptsActor.
+        /* Keep track of the 2nd-latest and latest reports of the number of receipts in
+         * the payments summary map, using a scan() function that traverses the output
+         * from the receiptsActor.
          */
-        outbox.scan(SummaryTracker()) { tracker, next ->
+        outFlow.scan(SummaryTracker()) { tracker, next ->
             SummaryTracker(
-                lastNumReceipts = tracker.numReceipts, // age this field
-                numReceipts = next.numReceipts, // get the latest one
+                lastNumReceipts = tracker.numReceipts, // old current value -> previous
+                numReceipts = next.numReceipts, // set the current value
                 nodesInUse = next.nodesInUse,
                 summaryString = next.summaryString,
-            )
+            ) // NOTE: Always drop() 1st value from scan(), which is the initial value.
         }.drop(1).onEach { tracker ->
             nodesInUse.value = tracker.nodesInUse
-            if (tracker.hasUpdated()) logger.log(tracker.summaryString)
-        }.takeWhile { tracker -> tracker.numReceipts < numPayments }.onCompletion {
-            summarizeJob.cancel()
-        }.filter { tracker -> !tracker.hasUpdated() }.collect {
-            /*
-             * If we've gotten here, then the receipt count isn't advancing,
-             * which has happened because we've missed some MapListener events
-             * (they're not guaranteed during cluster topology changes).
-             * If all payments have been issued, indicating the end of
-             * the run, force a rebuild of our data from the source map.
+            logger.log(tracker.summaryString)
+        }.takeWhile { tracker ->
+            tracker.numReceipts < numPayments
+        }.onCompletion {
+            this@coroutineScope.cancel()
+        }.filter { it.noProgress() }.collect { tracker ->
+            /* The receipt count isn't advancing, which has likely happened because
+             * we've missed some MapListener events (they're not guaranteed during
+             * cluster topology changes). If all payments have been now been issued,
+             * force a rebuild of our data from the source map.
              */
             if (getNumIssued() >= numPayments) {
-                receiptsActor.send(ReceiptsActor.Message.Rebuild(paymentReceiptMap))
-                receiptsActor.send(
-                    ReceiptsActor.Message.Summarize(
-                        getNumIssued(), outbox
-                    )
-                )
+                rebuildFromReceiptMap(tracker.numReceipts)
             }
         }
     }

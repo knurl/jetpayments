@@ -14,20 +14,11 @@ import kotlin.time.DurationUnit
 import kotlin.time.toDuration
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class PaymentsTest : FunSpec({
+class PaymentsUnitTests : FunSpec({
     val logger = ElapsedTimeLogger("PaymentsTest")
     val context = Dispatchers.Default + SupervisorJob()
     val merchantMap =
         MerchantGenerator(AppConfig.numMerchants, seededRandom).merchantMap
-    val longestName = merchantMap.values.maxOf { it.name.length }
-
-    fun logMerchants() {
-        TextBox(listOf("MERCHANTS:") + merchantMap.values.map { merchant ->
-            with(merchant) {
-                "${name.padEnd(longestName)} '${shortName}': $id"
-            }
-        }).center().addBorder().log(logger)
-    }
 
     val clusterSize = AppConfig.clusterSize
     val paymentFlow =
@@ -52,10 +43,26 @@ class PaymentsTest : FunSpec({
     }
 
     val client = runBlocking {
-        HzCluster("dev", AppConfig.clusterSize).getClient()
+        HzCluster("dev", clusterSize).getClient()
     }
     val paymentReceiptMap =
         client.getMap<Int, PaymentReceipt>(AppConfig.paymentReceiptMapName)
+
+    beforeEach {
+        fun logMerchants() {
+            val longestName = merchantMap.values.maxOf { it.name.length }
+            TextBox(listOf("MERCHANTS:") + merchantMap.values.map { merchant ->
+                with(merchant) {
+                    "${name.padEnd(longestName)} '${shortName}': $id"
+                }
+            }).center().addBorder().log(logger)
+        }
+
+        val paymentReceiptMap =
+            client.getMap<Int, PaymentReceipt>(AppConfig.paymentReceiptMapName)
+        paymentReceiptMap.clear()
+        logMerchants()
+    }
 
     test("test KafkaCluster to ensure re-readability") {
         val consumerGroup = AppConfig.kafkaVerifyPaymentsCG.uniqify()
@@ -157,9 +164,7 @@ class PaymentsTest : FunSpec({
     }
 
     test("test merchant distribution verification logic") {
-        logMerchants()
         val numWritten = MutableStateFlow(0)
-        paymentReceiptMap.clear()
 
         val requestChannel = produce(
             context = Dispatchers.IO, capacity = Channel.UNLIMITED
@@ -243,8 +248,6 @@ class PaymentsTest : FunSpec({
     test("test ReceiptWatcher") {
         val speedup = 4
         val numPayments = 500
-        paymentReceiptMap.clear()
-        logMerchants()
         val numWritten = MutableStateFlow(0)
 
         ReceiptWatcher(
@@ -268,9 +271,7 @@ class PaymentsTest : FunSpec({
     }
 
     test("test ReceiptSummary") {
-        logMerchants()
         val receiptSummary = ReceiptSummary()
-        paymentReceiptMap.clear()
 
         getPaymentFlow().take(numPayments).map { it.second }.collect { receipt ->
             paymentReceiptMap.put(receipt.paymentId, receipt)
@@ -306,7 +307,8 @@ class PaymentsTest : FunSpec({
         )
 
         val before = receiptSummary.capture()
-        receiptSummary.rebuildFromMap(paymentReceiptMap)
+        val numReceipts = receiptSummary.rebuildFromMap(paymentReceiptMap)
+        check(numReceipts == numPayments) { "numReceipts=$numReceipts != $numPayments" }
         val after = receiptSummary.capture()
         assert(before == after) { "before != after; before:\n$before\nafter:\n$after" }
     }

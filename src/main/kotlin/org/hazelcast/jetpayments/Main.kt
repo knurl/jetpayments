@@ -29,8 +29,8 @@ internal object AppConfig {
     val simulatePaymentProcessorFailure = false
     val reportFrequency = 5.seconds
     val seed = 9L
-    val paymentRequestDelayRand = RandomNormalDist(100.0, 25.0, seed)
-    val paymentProcessingDelayRand = RandomNormalDist(750.0, 250.0, seed)
+    val paymentRequestDelayRand = RandomNormalDist(100.0, 25.0, seed) // Millis
+    val paymentProcessingDelayRand = RandomNormalDist(750.0, 250.0, seed) // Millis
     val paymentAmountRand = RandomNormalDist(75.0, 37.5, seed)
     val enableMemberLogs = false
     val logLevel: Level = Level.SEVERE
@@ -53,6 +53,7 @@ internal object AppConfig {
     val jetStateHistorySize = 4
     val logPrefixLen = 24
     val displayWidth = screenWidth - logPrefixLen
+    val maxStallTime = reportFrequency * 3
 }
 
 internal val explainer = bold("EXPLAINER") + """
@@ -71,12 +72,19 @@ internal val explainer = bold("EXPLAINER") + """
     """
 
 internal fun getJavaParams(): List<String> {
-    return buildList {
-        add(System.getProperty("java.vm.name"))
-        add(System.getProperty("java.vendor"))
-        add(System.getProperty("java.version"))
+    val params = listOf(
+        "java.vm.name",
+        "java.vendor",
+        "java.version",
+        "java.vm.specification.name",
+    ).map { it to "$it: " }
+
+    val longest = params.maxOf { it.second.length }
+
+    return params.map { param ->
+        "${param.second.padEnd(longest)} ${System.getProperty(param.first)}"
     }.let { list ->
-        TextBox(list).center().addBorder().toStrings()
+        TextBox(list).addBorder().toStrings()
     }
 }
 
@@ -86,9 +94,11 @@ fun main() {
 
     // Show which VM we're using; display a helpful explainer about this demo.
     logger.log(getJavaParams())
-    logger.log(TextBox(
-        text = explainer.lines(), borderStyle = TextBox.BorderStyle.DOUBLE
-    ).rewrap(AppConfig.screenWidth - AppConfig.logPrefixLen).toStrings())
+    logger.log(
+        TextBox(
+            text = explainer.lines(), borderStyle = TextBox.BorderStyle.DOUBLE
+        ).rewrap(AppConfig.screenWidth - AppConfig.logPrefixLen).toStrings()
+    )
 
     /* Start the PaymentsRun demo. Simulate two down/up failure cycles. runBlocking
      * is used to bridge between coroutines and the main thread. It will suspend
@@ -117,11 +127,9 @@ internal val seededRandom = Random(AppConfig.seed)
  */
 internal object Epoch {
     private val theEpoch = MutableStateFlow(TimeSource.Monotonic.markNow())
-
     fun reset() {
         theEpoch.value = TimeSource.Monotonic.markNow()
     }
-
     fun timeNow() = theEpoch.value.elapsedNow()
 }
 

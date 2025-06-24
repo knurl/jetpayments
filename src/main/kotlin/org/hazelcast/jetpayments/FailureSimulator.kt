@@ -51,6 +51,7 @@ internal class FailureSimulator(
 
             val reqName = nodeCycleRequest.name
             val memberName = fontEtched(member)
+
             logger.log(emph("Starting $reqName $memberName"))
 
             // Adjust cluster topology and note the timeNow time for it.

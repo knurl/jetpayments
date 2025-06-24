@@ -71,7 +71,7 @@ internal class TextBox(
 
         // Left border, contents, right border
         lines.mapIndexed { i, str ->
-            "${chars.vert} $str${str.pad(textWidth)} ${chars.vert}"
+            "${chars.vert} ${str.padEnd(textWidth)} ${chars.vert}"
         }.let { addAll(it) }
 
         // Bottom border

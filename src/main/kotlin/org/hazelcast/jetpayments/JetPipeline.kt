@@ -103,9 +103,7 @@ abstract class JetPipeline(
     }.map { (jetState, _) ->
         jetState
     }.stateIn( // eager StateFlow, which starts collecting immediately
-        scope = scope,
-        started = SharingStarted.Eagerly,
-        initialValue = initialJetState
+        scope = scope, started = SharingStarted.Eagerly, initialValue = initialJetState
     )
 
     /*
@@ -148,6 +146,16 @@ abstract class JetPipeline(
     protected abstract fun describePipeline(): String // Documentation only
     protected abstract val pipeline: Pipeline // The actual Jet Pipeline
 
+    fun summarize(): List<String> =
+        TextBox(bold(italic("Starting Jet job $jobName"))).stack(
+            TextBox(pipeline.toDotString().lines()).addBorder()
+        ).let { left ->
+            val wrapLen =
+                AppConfig.screenWidth - AppConfig.logPrefixLen - left.width - 8
+            val right = TextBox(describePipeline().lines()).rewrap(wrapLen)
+            left.adjoin(right).addBorder().toStrings()
+        }
+
     /*
      * Run the Jet pipeline. If it's a batch job, this function will return when it
      * completes. If it's a streaming job, then the job needs to be externally
@@ -155,16 +163,6 @@ abstract class JetPipeline(
      * job has terminated and it will then return.
      */
     suspend fun run() {
-        // Provide some helpful info on the Jet pipeline to the user
-        TextBox(bold(italic("Starting Jet job $jobName"))).stack(
-            TextBox(pipeline.toDotString().lines()).addBorder()
-        ).let { left ->
-            val wrapLen =
-                AppConfig.screenWidth - AppConfig.logPrefixLen - left.width - 8
-            val right = TextBox(describePipeline().lines()).rewrap(wrapLen)
-            left.adjoin(right).addBorder().log(logger)
-        }
-
         // Configure the Jet job
         val jetJobConfig = JobConfig().apply {
             name = jobName
